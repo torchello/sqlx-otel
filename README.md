@@ -87,9 +87,28 @@ let pool = PoolBuilder::from(raw_pool)
 
 `network.protocol.name` defaults to the backend's wire protocol (`"postgresql"` for Postgres, `"mysql"` for MySQL, absent for SQLite); override only when the connection is tunnelled through a different application-layer protocol. `network.transport` is not inferred from the connect string – callers who want this attribute on spans / metrics must declare it explicitly so the value reflects the deployment configuration rather than a guess.
 
+## Automatic query summaries
+
+Enable conservative low-cardinality `db.query.summary` generation when a short operation
+name is useful for grouping:
+
+```rust
+use sqlx_otel::{PoolBuilder, QuerySummaryMode};
+
+let pool = PoolBuilder::from(raw_pool)
+    .with_query_summary_mode(QuerySummaryMode::Auto)
+    .build();
+```
+
+The summary contains only the outer operation and primary target, such as `SELECT users` or
+`INSERT orders`. Common table expressions are resolved to their primary physical target
+when possible. Predicates, selected columns, literal values, and bind parameters are never
+included. Explicit per-query annotations take precedence.
+
 ## Per-query annotations
 
-Because the library does not parse SQL, per-query attributes are the caller's responsibility:
+Operation, collection, stored-procedure, and custom summary annotations can be supplied by
+the caller:
 
 ```rust
 use sqlx_otel::{QueryAnnotateExt, QueryAnnotations};
