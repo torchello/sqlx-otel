@@ -183,7 +183,7 @@ fn find_operation(tokens: &[Token], start: usize) -> Option<(String, usize)> {
             Token::RightParen => depth = depth.saturating_sub(1),
             Token::Semicolon if depth == 0 => return None,
             Token::Word(word) if depth == 0 && is_operation(word) => {
-                return Some((word.to_ascii_uppercase(), index));
+                return Some((word.clone(), index));
             }
             _ => {}
         }
@@ -592,10 +592,10 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_operation_casing() {
+    fn preserves_operation_casing() {
         assert_eq!(
             summarize("select * from users").as_deref(),
-            Some("SELECT users")
+            Some("select users")
         );
     }
 
