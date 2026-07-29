@@ -5,7 +5,7 @@ mod common;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use common::{assert_error_span, attr, test_annotations};
+use common::{assert_error_span, attr, event_attr, test_annotations};
 use serial_test::serial;
 use sqlx::Executor as _;
 use sqlx::Postgres;
@@ -464,6 +464,14 @@ async fn sqlstate_recorded_on_constraint_violation() {
     assert_eq!(
         attr(&spans[0], "db.response.status_code"),
         Some(opentelemetry::Value::String("23505".into()))
+    );
+    assert_eq!(
+        attr(&spans[0], "error.type"),
+        Some(opentelemetry::Value::String("23505".into()))
+    );
+    assert_eq!(
+        event_attr(&spans[0], "exception", "exception.type"),
+        Some(opentelemetry::Value::String("sqlx::Error::Database".into()))
     );
 }
 

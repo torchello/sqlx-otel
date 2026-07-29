@@ -119,27 +119,42 @@ fn begin_query_span(
     (cx, start, metric_attrs)
 }
 
-/// Classify a `sqlx::Error` variant into a string suitable for `error.type`.
-fn error_type(err: &sqlx::Error) -> &'static str {
+/// Return the canonical `SQLx` error variant name used for `exception.type` and as the
+/// `error.type` fallback when the database or client library did not provide a status code.
+fn exception_type(err: &sqlx::Error) -> &'static str {
     match err {
-        sqlx::Error::Configuration(_) => "Configuration",
-        sqlx::Error::Database(_) => "Database",
-        sqlx::Error::Io(_) => "Io",
-        sqlx::Error::Tls(_) => "Tls",
-        sqlx::Error::Protocol(_) => "Protocol",
-        sqlx::Error::RowNotFound => "RowNotFound",
-        sqlx::Error::TypeNotFound { .. } => "TypeNotFound",
-        sqlx::Error::ColumnIndexOutOfBounds { .. } => "ColumnIndexOutOfBounds",
-        sqlx::Error::ColumnNotFound(_) => "ColumnNotFound",
-        sqlx::Error::ColumnDecode { .. } => "ColumnDecode",
-        sqlx::Error::Decode(_) => "Decode",
-        sqlx::Error::AnyDriverError(_) => "AnyDriverError",
-        sqlx::Error::PoolTimedOut => "PoolTimedOut",
-        sqlx::Error::PoolClosed => "PoolClosed",
-        sqlx::Error::WorkerCrashed => "WorkerCrashed",
-        sqlx::Error::Migrate(_) => "Migrate",
-        _ => "Unknown",
+        sqlx::Error::Configuration(_) => "sqlx::Error::Configuration",
+        sqlx::Error::Database(_) => "sqlx::Error::Database",
+        sqlx::Error::Io(_) => "sqlx::Error::Io",
+        sqlx::Error::Tls(_) => "sqlx::Error::Tls",
+        sqlx::Error::Protocol(_) => "sqlx::Error::Protocol",
+        sqlx::Error::RowNotFound => "sqlx::Error::RowNotFound",
+        sqlx::Error::TypeNotFound { .. } => "sqlx::Error::TypeNotFound",
+        sqlx::Error::ColumnIndexOutOfBounds { .. } => "sqlx::Error::ColumnIndexOutOfBounds",
+        sqlx::Error::ColumnNotFound(_) => "sqlx::Error::ColumnNotFound",
+        sqlx::Error::ColumnDecode { .. } => "sqlx::Error::ColumnDecode",
+        sqlx::Error::Decode(_) => "sqlx::Error::Decode",
+        sqlx::Error::AnyDriverError(_) => "sqlx::Error::AnyDriverError",
+        sqlx::Error::PoolTimedOut => "sqlx::Error::PoolTimedOut",
+        sqlx::Error::PoolClosed => "sqlx::Error::PoolClosed",
+        sqlx::Error::WorkerCrashed => "sqlx::Error::WorkerCrashed",
+        sqlx::Error::Migrate(_) => "sqlx::Error::Migrate",
+        _ => "sqlx::Error::Unknown",
     }
+}
+
+/// Classify an error according to the database client semantic conventions.
+///
+/// Database status codes are the most specific stable classification available, so they
+/// take precedence over the generic `SQLx` error variant. Non-database errors and database
+/// errors without a code fall back to their canonical `SQLx` variant name.
+fn error_type(err: &sqlx::Error) -> Cow<'static, str> {
+    if let sqlx::Error::Database(db_err) = err {
+        if let Some(code) = db_err.code() {
+            return Cow::Owned(code.into_owned());
+        }
+    }
+    Cow::Borrowed(exception_type(err))
 }
 
 /// Record an error on the span within the given context: set status, `error.type`, and add an
@@ -149,12 +164,19 @@ fn error_type(err: &sqlx::Error) -> &'static str {
 /// extraction.
 fn record_error(cx: &OtelContext, err: &sqlx::Error, metric_attrs: &mut Vec<KeyValue>) {
     let span = cx.span();
-    let kind = error_type(err);
+    let error_type = error_type(err);
+    let exception_type = exception_type(err);
     span.set_status(Status::Error {
         description: Cow::Owned(err.to_string()),
     });
-    span.set_attribute(KeyValue::new(attribute::ERROR_TYPE, kind));
-    metric_attrs.push(KeyValue::new(attribute::ERROR_TYPE, kind));
+    span.set_attribute(KeyValue::new(
+        attribute::ERROR_TYPE,
+        error_type.as_ref().to_owned(),
+    ));
+    metric_attrs.push(KeyValue::new(
+        attribute::ERROR_TYPE,
+        error_type.as_ref().to_owned(),
+    ));
     // Extract SQLSTATE or database-specific error code when available.
     if let sqlx::Error::Database(db_err) = err {
         if let Some(code) = db_err.code() {
@@ -169,7 +191,7 @@ fn record_error(cx: &OtelContext, err: &sqlx::Error, metric_attrs: &mut Vec<KeyV
     span.add_event(
         "exception",
         vec![
-            KeyValue::new("exception.type", kind),
+            KeyValue::new("exception.type", exception_type),
             KeyValue::new("exception.message", err.to_string()),
         ],
     );
@@ -711,52 +733,70 @@ mod tests {
     #[test]
     fn error_type_classification() {
         // Unit variants.
-        assert_eq!(error_type(&sqlx::Error::RowNotFound), "RowNotFound");
-        assert_eq!(error_type(&sqlx::Error::PoolTimedOut), "PoolTimedOut");
-        assert_eq!(error_type(&sqlx::Error::PoolClosed), "PoolClosed");
-        assert_eq!(error_type(&sqlx::Error::WorkerCrashed), "WorkerCrashed");
+        assert_eq!(
+            error_type(&sqlx::Error::RowNotFound),
+            "sqlx::Error::RowNotFound"
+        );
+        assert_eq!(
+            error_type(&sqlx::Error::PoolTimedOut),
+            "sqlx::Error::PoolTimedOut"
+        );
+        assert_eq!(
+            error_type(&sqlx::Error::PoolClosed),
+            "sqlx::Error::PoolClosed"
+        );
+        assert_eq!(
+            error_type(&sqlx::Error::WorkerCrashed),
+            "sqlx::Error::WorkerCrashed"
+        );
 
         // String / boxed-error variants.
         assert_eq!(
             error_type(&sqlx::Error::Configuration("bad".into())),
-            "Configuration"
+            "sqlx::Error::Configuration"
         );
         assert_eq!(
             error_type(&sqlx::Error::Io(std::io::Error::other("test"))),
-            "Io"
+            "sqlx::Error::Io"
         );
-        assert_eq!(error_type(&sqlx::Error::Tls("tls".into())), "Tls");
+        assert_eq!(
+            error_type(&sqlx::Error::Tls("tls".into())),
+            "sqlx::Error::Tls"
+        );
         assert_eq!(
             error_type(&sqlx::Error::Protocol("proto".into())),
-            "Protocol"
+            "sqlx::Error::Protocol"
         );
-        assert_eq!(error_type(&sqlx::Error::Decode("dec".into())), "Decode");
+        assert_eq!(
+            error_type(&sqlx::Error::Decode("dec".into())),
+            "sqlx::Error::Decode"
+        );
         assert_eq!(
             error_type(&sqlx::Error::AnyDriverError("any".into())),
-            "AnyDriverError"
+            "sqlx::Error::AnyDriverError"
         );
 
         // Struct variants.
         assert_eq!(
             error_type(&sqlx::Error::ColumnNotFound("x".into())),
-            "ColumnNotFound"
+            "sqlx::Error::ColumnNotFound"
         );
         assert_eq!(
             error_type(&sqlx::Error::ColumnIndexOutOfBounds { index: 5, len: 3 }),
-            "ColumnIndexOutOfBounds"
+            "sqlx::Error::ColumnIndexOutOfBounds"
         );
         assert_eq!(
             error_type(&sqlx::Error::ColumnDecode {
                 index: "0".into(),
                 source: "bad".into(),
             }),
-            "ColumnDecode"
+            "sqlx::Error::ColumnDecode"
         );
         assert_eq!(
             error_type(&sqlx::Error::TypeNotFound {
                 type_name: "Foo".into(),
             }),
-            "TypeNotFound"
+            "sqlx::Error::TypeNotFound"
         );
 
         // Migrate variant (behind sqlx's "migrate" default feature).
@@ -764,10 +804,10 @@ mod tests {
             error_type(&sqlx::Error::Migrate(Box::new(
                 sqlx::migrate::MigrateError::Execute(sqlx::Error::Protocol("test".into()))
             ))),
-            "Migrate"
+            "sqlx::Error::Migrate"
         );
 
-        // The `_ => "Unknown"` branch covers future sqlx::Error variants that may be
+        // The `_ => "sqlx::Error::Unknown"` branch covers future sqlx::Error variants that may be
         // added in newer sqlx releases. It cannot be tested directly since we cannot
         // construct an unknown variant, but it ensures forward compatibility.
     }

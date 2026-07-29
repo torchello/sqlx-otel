@@ -87,6 +87,20 @@ pub fn attr(span: &SpanData, key: &str) -> Option<opentelemetry::Value> {
         .map(|kv| kv.value.clone())
 }
 
+/// Find an attribute on the first span event with the supplied name.
+pub fn event_attr(span: &SpanData, event_name: &str, key: &str) -> Option<opentelemetry::Value> {
+    span.events
+        .iter()
+        .find(|event| event.name == event_name)
+        .and_then(|event| {
+            event
+                .attributes
+                .iter()
+                .find(|kv| kv.key.as_str() == key)
+                .map(|kv| kv.value.clone())
+        })
+}
+
 /// Find the attribute value for a given key on a histogram data point.
 ///
 /// Mirrors [`attr`] for the metric side: walks the data point's attribute iterator and
@@ -2360,6 +2374,11 @@ macro_rules! test_operation_duration_metric_carries_sqlstate {
             $crate::common::metric_attr(&dp, "db.response.status_code"),
             Some(opentelemetry::Value::String($expected_code.into())),
             "metric must carry db.response.status_code for sqlx::Error::Database",
+        );
+        assert_eq!(
+            $crate::common::metric_attr(&dp, "error.type"),
+            Some(opentelemetry::Value::String($expected_code.into())),
+            "error.type must match db.response.status_code for sqlx::Error::Database",
         );
     }};
 }

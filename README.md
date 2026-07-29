@@ -176,11 +176,14 @@ Set on every `Executor` method (`execute`, `fetch`, `fetch_all`, `fetch_one`, `f
 | `db.response.returned_rows`      | Row count                                                   | On `fetch*` methods         |
 | `db.response.affected_rows`      | Rows affected (`rows_affected()`)                           | On `execute`                |
 | `db.response.status_code`        | SQLSTATE error code                                         | On database errors          |
-| `error.type`                     | Error variant name                                          | On any error                |
+| `error.type`                     | Database status code or canonical SQLx error variant         | On any error                |
 
 `db.response.affected_rows` is not part of the OpenTelemetry semantic conventions, but we find it useful so have included it. It is a custom attribute that reports the database-confirmed count from `QueryResult::rows_affected()`, carrying the same connection-level attributes as `db.response.returned_rows`. It is not recorded for `execute_many`, which is [considered deprecated by the SQLx team](https://github.com/launchbadge/sqlx/issues/3108).
 
-On error, the span status is set to `Error` and an `exception` event is added with `exception.type` and `exception.message` attributes.
+On error, the span status is set to `Error`. For database errors, `error.type` matches
+`db.response.status_code` when the driver provides one; otherwise it is the canonical SQLx
+error variant name. An `exception` event is added with the canonical SQLx variant in
+`exception.type` and the error description in `exception.message`.
 
 ### Operation metrics
 
@@ -223,7 +226,7 @@ The first four are recorded inline on every `acquire()` / connection drop – no
 
 - **MSRV:** Rust **1.85.0**.
 - **SQLx:** `0.8.x`.
-- **OpenTelemetry:** `0.31.x`.
+- **OpenTelemetry:** `0.32.x`.
 
 ## License
 

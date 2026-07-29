@@ -13,6 +13,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Updated `opentelemetry`, `opentelemetry-semantic-conventions`, and the test SDK to
+  `0.32.x`.
+- `error.type` now matches `db.response.status_code` for database errors when the driver
+  provides a code, as required by the database client semantic conventions. Other errors
+  use their canonical `sqlx::Error::<Variant>` name; `exception.type` remains the canonical
+  SQLx variant rather than a database status code.
 - `db.client.connection.pool.name` previously appeared only on the `db.client.connection.count` gauge; it now also propagates to spans, the `db.client.operation.duration` / `db.client.response.returned_rows` histograms, and the rest of the `db.client.connection.*` family via the shared connection-attribute set. The `count` gauge's attribute set is unchanged ([#32](https://github.com/chmodas/sqlx-otel/pull/32)).
 - `db.query.text` now collapses inter-token whitespace runs to a single space and trims leading/trailing whitespace for both `QueryTextMode::Full` (default) and `QueryTextMode::Obfuscated`. Whitespace inside string literals, quoted identifiers, dollar-quoted bodies, and comments is preserved verbatim. Multi-line SQL written for source-level readability now renders as a single readable line in OTel exports without the embedded `\n` and indentation runs that came from source-level formatting. `QueryTextMode::Off` is unchanged ([#34](https://github.com/chmodas/sqlx-otel/pull/34)).
 
