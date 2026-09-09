@@ -592,6 +592,50 @@ mod tokio_runtime {
 
     #[tokio::test]
     #[serial]
+    async fn background_task_survives_clone_drop_and_pool_queries() {
+        let tel = common::TestTelemetry::install();
+        let raw = sqlx::SqlitePool::connect(":memory:").await.unwrap();
+        let pool = PoolBuilder::from(raw)
+            .with_pool_name(POOL_NAME)
+            .with_pool_metrics_interval(Duration::from_millis(50))
+            .build();
+
+        let clone = pool.clone();
+        // Dropping a clone must NOT stop the polling task
+        drop(clone);
+
+        // Pool executors also hold short-lived clones for implicit acquisition.
+        pool.fetch_one("SELECT 1").await.unwrap();
+        pool.with_operation("SELECT", "test")
+            .fetch_one("SELECT 2")
+            .await
+            .unwrap();
+
+        let conn = pool.acquire().await.unwrap();
+
+        let used = poll_for(Duration::from_secs(2), || {
+            tel.reset();
+            let snapshot = tel.metrics();
+            let used = gauge_value(
+                &snapshot,
+                "db.client.connection.count",
+                "db.client.connection.state",
+                "used",
+            )?;
+            if used >= 1 { Some(used) } else { None }
+        })
+        .await;
+
+        assert!(
+            used.is_some(),
+            "connection.count should keep updating after a clone is dropped"
+        );
+
+        drop(conn);
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn no_pool_metrics_without_pool_name() {
         let tel = common::TestTelemetry::install();
         let raw = sqlx::SqlitePool::connect(":memory:").await.unwrap();
