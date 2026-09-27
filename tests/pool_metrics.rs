@@ -11,6 +11,90 @@ use std::time::Duration;
 
 const POOL_NAME: &str = "test-pool";
 
+#[tokio::test]
+#[serial]
+async fn latency_histograms_use_seconds_scale_buckets_and_allow_view_overrides() {
+    use opentelemetry_sdk::metrics::{
+        Aggregation, InMemoryMetricExporter, Instrument, PeriodicReader, SdkMeterProvider, Stream,
+    };
+
+    const LATENCY_NAMES: [&str; 3] = [
+        "db.client.operation.duration",
+        "db.client.connection.wait_time",
+        "db.client.connection.use_time",
+    ];
+    const EXPECTED: &[f64] = &[
+        0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+        10.0, 30.0, 60.0,
+    ];
+    const OVERRIDE: &[f64] = &[0.005, 0.05, 0.5, 5.0];
+    const DEFAULT_ROW_BUCKETS: &[f64] = &[
+        0.0, 5.0, 10.0, 25.0, 50.0, 75.0, 100.0, 250.0, 500.0, 750.0, 1000.0, 2500.0, 5000.0,
+        7500.0, 10000.0,
+    ];
+
+    // Assert the exported layout both without a view and with one. Checking only the
+    // override would pass even if the instruments supplied no boundaries at all.
+    for view_boundaries in [None, Some(OVERRIDE)] {
+        let exporter = InMemoryMetricExporter::default();
+        let mut builder = SdkMeterProvider::builder()
+            .with_reader(PeriodicReader::builder(exporter.clone()).build());
+        if let Some(boundaries) = view_boundaries {
+            builder = builder.with_view(move |instrument: &Instrument| {
+                LATENCY_NAMES.contains(&instrument.name()).then(|| {
+                    Stream::builder()
+                        .with_aggregation(Aggregation::ExplicitBucketHistogram {
+                            boundaries: boundaries.to_vec(),
+                            record_min_max: true,
+                        })
+                        .build()
+                        .unwrap()
+                })
+            });
+        }
+        let provider = builder.build();
+        opentelemetry::global::set_meter_provider(provider.clone());
+        let pool = PoolBuilder::from(sqlx::SqlitePool::connect(":memory:").await.unwrap()).build();
+        drop(pool.acquire().await.unwrap());
+        pool.execute("CREATE TABLE test (id integer)")
+            .await
+            .unwrap();
+        pool.execute("INSERT INTO test VALUES (1)").await.unwrap();
+        pool.fetch_all("SELECT id FROM test").await.unwrap();
+        pool.close().await;
+        drop(pool);
+        provider.force_flush().unwrap();
+
+        let collected = exporter.get_finished_metrics().unwrap();
+        for name in LATENCY_NAMES.into_iter().chain([
+            "db.client.response.returned_rows",
+            "db.client.response.affected_rows",
+        ]) {
+            let metric = find_metric(&collected, name).expect("histogram not recorded");
+            let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = metric.data() else {
+                panic!("expected histogram for {name}");
+            };
+            let expected = if LATENCY_NAMES.contains(&name) {
+                assert_eq!(metric.unit(), "s", "{name} unit");
+                view_boundaries.unwrap_or(EXPECTED)
+            } else {
+                DEFAULT_ROW_BUCKETS
+            };
+            let points: Vec<_> = histogram.data_points().collect();
+            assert!(!points.is_empty(), "{name} has no observations");
+            for point in points {
+                assert!(point.count() > 0, "{name} has no observations");
+                assert_eq!(
+                    point.bounds().collect::<Vec<_>>(),
+                    expected,
+                    "{name} bounds"
+                );
+            }
+        }
+        provider.shutdown().unwrap();
+    }
+}
+
 fn histogram_count(tel: &common::TestTelemetry, name: &str) -> u64 {
     tel.reset();
     let metrics = tel.metrics();

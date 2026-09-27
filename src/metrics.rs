@@ -4,6 +4,15 @@ use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Histogram, Meter};
 use opentelemetry_semantic_conventions::metric;
 
+/// Explicit boundaries in seconds for operation, acquisition, and connection-use latency.
+///
+/// SDK defaults start at 0 and 5, collapsing typical subsecond durations into one bucket.
+/// These are instrument advice; applications can override them with a metric view.
+pub(crate) const LATENCY_BUCKETS_SECONDS: &[f64] = &[
+    0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+    30.0, 60.0,
+];
+
 /// Holds the OpenTelemetry metric instruments for per-operation recording.
 ///
 /// Created once per [`Pool`](crate::Pool) and shared (via `Arc`) across all wrapper types
@@ -28,6 +37,7 @@ impl Metrics {
             .f64_histogram(metric::DB_CLIENT_OPERATION_DURATION)
             .with_unit("s")
             .with_description("Duration of database client operations.")
+            .with_boundaries(LATENCY_BUCKETS_SECONDS.to_vec())
             .build();
         let returned_rows = meter
             .f64_histogram(metric::DB_CLIENT_RESPONSE_RETURNED_ROWS)

@@ -238,6 +238,19 @@ timeout. Only `sqlx::Error::PoolTimedOut` increments the timeout counter. Pendin
 timeout series are initialized at zero; wait buckets resolve submillisecond acquisitions.
 Connection-use time follows the lease through transaction commit, rollback, or drop.
 
+All three latency histograms (`db.client.operation.duration`,
+`db.client.connection.wait_time`, and `db.client.connection.use_time`) use explicit
+boundaries in seconds:
+
+```text
+0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1,
+0.25, 0.5, 1, 2.5, 5, 10, 30, 60
+```
+
+This preserves resolution for subsecond operations instead of grouping them into the
+SDK's default `(0, 5]` bucket. Applications can override this instrument advice with
+an OpenTelemetry SDK View. Row-count histograms retain their default boundaries.
+
 `db.client.connection.count` is polled by a background task and requires both a runtime
 feature (`runtime-tokio` or `runtime-async-std`) and a pool name set via
 `PoolBuilder::with_pool_name`. Polling and export intervals can miss brief utilization or

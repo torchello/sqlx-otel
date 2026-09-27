@@ -250,10 +250,7 @@ impl<DB: Database> PoolBuilder<DB> {
                     .with_description(
                         "The time it took to obtain an open connection from the pool.",
                     )
-                    .with_boundaries(vec![
-                        0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5,
-                        1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
-                    ])
+                    .with_boundaries(crate::metrics::LATENCY_BUCKETS_SECONDS.to_vec())
                     .build(),
             ),
             use_time: Arc::new(
@@ -263,6 +260,7 @@ impl<DB: Database> PoolBuilder<DB> {
                     .with_description(
                         "The time between borrowing a connection and returning it to the pool.",
                     )
+                    .with_boundaries(crate::metrics::LATENCY_BUCKETS_SECONDS.to_vec())
                     .build(),
             ),
             timeouts: Arc::new(
