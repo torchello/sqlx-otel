@@ -156,7 +156,9 @@ impl<DB: Database> PoolBuilder<DB> {
     /// [`QuerySummaryMode::Off`].
     ///
     /// [`QuerySummaryMode::Auto`] extracts only the outer SQL operation and primary
-    /// target. Explicit per-query [`QueryAnnotations`] take precedence.
+    /// target, independently of [`QueryTextMode`]. Any explicit per-query
+    /// [`QueryAnnotations`] disable inference, even without a custom summary. See
+    /// [`QuerySummaryMode`] for limits and cardinality considerations.
     #[must_use]
     pub fn with_query_summary_mode(mut self, mode: QuerySummaryMode) -> Self {
         self.query_summary_mode = mode;

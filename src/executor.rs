@@ -98,8 +98,9 @@ fn start_span(name: &str, span_attrs: Vec<KeyValue>) -> (OtelContext, Instant) {
 /// attributes plus the four annotation-derived attributes when present, plus error-path attributes
 /// (`error.type`, `db.response.status_code`) appended later by `record_error`. The unbounded
 /// `db.query.text` attribute is deliberately excluded. Automatically generated
-/// `db.query.summary` values contain an operation/target pair; dynamically named targets still contribute to
-/// cardinality. Explicit summaries remain caller-controlled.
+/// `db.query.summary` values may contain an operation and target or only an operation;
+/// dynamically named targets still contribute to cardinality. Explicit summaries remain
+/// caller-controlled.
 fn begin_query_span(
     attrs: &ConnectionAttributes,
     sql: Option<&str>,
@@ -109,7 +110,7 @@ fn begin_query_span(
     let annotations = if annotations.is_none() && attrs.query_summary_mode == QuerySummaryMode::Auto
     {
         generated_annotations = sql
-            .and_then(crate::summary::summarize)
+            .and_then(|sql| crate::summary::summarize(sql, attrs.system))
             .map(|summary| QueryAnnotations::new().query_summary(summary));
         generated_annotations.as_ref()
     } else {
@@ -1375,6 +1376,18 @@ mod tests {
                 !out.contains("XSECRETX"),
                 "sentinel leaked through chain: input={s:?} output={out:?}"
             );
+        }
+
+        /// The same supported marked literal shapes must not enter automatically
+        /// generated summaries for any backend.
+        #[test]
+        fn automatic_summary_does_not_expose_marked_literals(s in chain_fragment_marked()) {
+            let sql = format!("SELECT {s} FROM known_target WHERE token = '{CHAIN_SENTINEL}'");
+            for system in ["postgresql", "mysql", "sqlite"] {
+                let summary = crate::summary::summarize(&sql, system);
+                prop_assert!(summary.as_ref().is_none_or(|value| !value.contains(CHAIN_SENTINEL)),
+                    "sentinel leaked into summary: input={sql:?} output={summary:?}");
+            }
         }
 
         /// Trim invariant on the emitted `db.query.text`: for both `Full` and

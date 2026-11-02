@@ -590,6 +590,42 @@ async fn automatic_summaries_are_opt_in_and_group_without_literal_values() {
     );
 }
 
+#[tokio::test]
+#[serial]
+async fn explicit_annotations_without_summary_suppress_auto_inference() {
+    use sqlx_otel::{QueryAnnotations, QuerySummaryMode, QueryTextMode};
+
+    let tel = common::TestTelemetry::install();
+    let pool = PoolBuilder::from(raw_pool().await)
+        .with_query_text_mode(QueryTextMode::Off)
+        .with_query_summary_mode(QuerySummaryMode::Auto)
+        .build();
+
+    pool.with_operation("LOOKUP", "logical_users")
+        .fetch_all("SELECT name FROM sqlite_master")
+        .await
+        .unwrap();
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].name, "LOOKUP logical_users");
+    assert_eq!(common::attr(&spans[0], "db.query.summary"), None);
+    assert_eq!(common::attr(&spans[0], "db.query.text"), None);
+    tel.reset();
+
+    sqlx::query("SELECT name FROM sqlite_master")
+        .with_annotations(QueryAnnotations::new())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].name, "sqlite");
+    assert_eq!(common::attr(&spans[0], "db.query.summary"), None);
+    assert_eq!(common::attr(&spans[0], "db.operation.name"), None);
+    assert_eq!(common::attr(&spans[0], "db.collection.name"), None);
+    assert_eq!(common::attr(&spans[0], "db.query.text"), None);
+}
+
 // ===========================================================================
 // query-side annotations: sqlx::query(...).with_annotations(...).execute(&pool)
 // ===========================================================================

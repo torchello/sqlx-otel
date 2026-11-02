@@ -3,8 +3,9 @@
 //! The OpenTelemetry database semantic conventions recommend using
 //! `db.query.summary` as the span name when query-level instrumentation can derive one.
 //! This module intentionally extracts only the outer operation and its primary target.
-//! Predicates, selected columns, literal values, and bind parameters never participate in
-//! the summary.
+//! Recognized literals are scrubbed before extraction; supported forms omit predicates,
+//! selected columns, and bind parameters. This is not a complete SQL parser or a general
+//! redaction boundary for arbitrary dialect extensions.
 
 const MAX_SUMMARY_BYTES: usize = 255;
 const MAX_CTE_RESOLUTION_DEPTH: usize = 16;
@@ -33,12 +34,11 @@ struct Target {
 }
 
 /// Return a short summary such as `SELECT users` or `INSERT orders`.
-pub(crate) fn summarize(sql: &str) -> Option<String> {
-    // Run the same literal scrubber used by QueryTextMode::Obfuscated before parsing.
-    // Query summaries therefore cannot accidentally incorporate a literal even if the
-    // lightweight tokenizer below encounters malformed SQL.
+pub(crate) fn summarize(sql: &str, system: &str) -> Option<String> {
+    // Reuse QueryTextMode::Obfuscated's literal handling before extraction. Both passes
+    // are best effort; callers with sensitive SQL should leave automatic summaries off.
     let sanitized = crate::obfuscate::obfuscate(sql);
-    let tokens = tokenize(&sanitized);
+    let tokens = tokenize(&sanitized, system == "mysql");
     let (operation, target) = summarize_tokens(&tokens, &[], &mut Vec::new(), 0)?;
     let Some(target) = target else {
         return Some(operation);
@@ -107,7 +107,13 @@ fn resolve_cte_target(
     scopes.push(local_ctes);
     scopes.extend_from_slice(inherited_cte_scopes);
     let resolved = summarize_tokens(&cte.body, &scopes, visited_ctes, resolution_depth + 1)
-        .and_then(|(_, nested_target)| nested_target)
+        .and_then(|(operation, nested_target)| {
+            if operation.eq_ignore_ascii_case("SELECT") {
+                nested_target
+            } else {
+                None
+            }
+        })
         .unwrap_or(target);
     visited_ctes.pop();
     resolved
@@ -180,19 +186,10 @@ fn matching_right_paren(tokens: &[Token], open: usize) -> Option<usize> {
 }
 
 fn find_operation(tokens: &[Token], start: usize) -> Option<(String, usize)> {
-    let mut depth = 0_u32;
-    for (index, token) in tokens.iter().enumerate().skip(start) {
-        match token {
-            Token::LeftParen => depth = depth.saturating_add(1),
-            Token::RightParen => depth = depth.saturating_sub(1),
-            Token::Semicolon if depth == 0 => return None,
-            Token::Word(word) if depth == 0 && is_operation(word) => {
-                return Some((word.clone(), index));
-            }
-            _ => {}
-        }
-    }
-    None
+    let Token::Word(word) = tokens.get(start)? else {
+        return None;
+    };
+    is_operation(word).then(|| (word.clone(), start))
 }
 
 fn find_target(tokens: &[Token], operation_index: usize, operation: &str) -> Option<Target> {
@@ -377,7 +374,7 @@ fn is_clause_keyword(word: &str) -> bool {
     .any(|keyword| word.eq_ignore_ascii_case(keyword))
 }
 
-fn tokenize(sql: &str) -> Vec<Token> {
+fn tokenize(sql: &str, mysql_comments: bool) -> Vec<Token> {
     let bytes = sql.as_bytes();
     let mut tokens = Vec::new();
     let mut index = 0;
@@ -391,8 +388,19 @@ fn tokenize(sql: &str) -> Vec<Token> {
                     index += 1;
                 }
             }
+            b'#' if mysql_comments => {
+                // PostgreSQL also permits '#' in operators; this is MySQL-only.
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
             b'/' if bytes.get(index + 1) == Some(&b'*') => {
                 index = skip_block_comment(bytes, index);
+            }
+            b'\'' => {
+                // A dialect-specific comment may have desynchronized the shared scrubber.
+                // Skip any literal that survives rather than treating its contents as SQL.
+                index = scan_doubled_quote(bytes, index, b'\'');
             }
             b'"' | b'`' => {
                 let quote = bytes[index];
@@ -462,6 +470,10 @@ fn skip_block_comment(bytes: &[u8], mut index: usize) -> usize {
 fn scan_doubled_quote(bytes: &[u8], start: usize, quote: u8) -> usize {
     let mut index = start + 1;
     while index < bytes.len() {
+        if quote == b'\'' && bytes[index] == b'\\' {
+            index += if index + 1 < bytes.len() { 2 } else { 1 };
+            continue;
+        }
         if bytes[index] == quote {
             if bytes.get(index + 1) == Some(&quote) {
                 index += 2;
@@ -499,7 +511,11 @@ fn is_word_continue(byte: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::summarize;
+    use proptest::prelude::*;
+
+    fn summarize(sql: &str) -> Option<String> {
+        super::summarize(sql, "postgresql")
+    }
 
     #[test]
     fn summarizes_simple_statements() {
@@ -575,6 +591,80 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_outer_operations_do_not_expose_nested_operations() {
+        for sql in [
+            "REVOKE SELECT ON accounts FROM app_role",
+            "GRANT SELECT ON accounts TO app_role",
+            "SHOW CREATE TABLE accounts",
+            "REPLACE INTO reports SELECT * FROM source",
+            "DECLARE cursor_name CURSOR FOR SELECT * FROM accounts",
+            "PREPARE query_name AS SELECT * FROM accounts",
+        ] {
+            assert_eq!(summarize(sql), None, "sql: {sql}");
+        }
+    }
+
+    #[test]
+    fn read_cte_does_not_resolve_to_a_nested_write_target() {
+        let sql = "WITH deleted AS (DELETE FROM jobs RETURNING *) SELECT * FROM deleted";
+        assert_eq!(summarize(sql).as_deref(), Some("SELECT deleted"));
+    }
+
+    #[test]
+    fn mysql_hash_comments_cannot_supply_targets() {
+        for (sql, expected) in [
+            ("SELECT NOW() # FROM tenant_acme", "SELECT"),
+            (
+                "SELECT NOW() # FROM tenant_acme\n FROM users",
+                "SELECT users",
+            ),
+            (
+                "# SELECT * FROM tenant_acme\n SELECT * FROM users",
+                "SELECT users",
+            ),
+            ("SELECT * FROM `tenant#users`", "SELECT `tenant#users`"),
+            ("SELECT '# FROM tenant_acme' FROM users", "SELECT users"),
+        ] {
+            assert_eq!(super::summarize(sql, "mysql").as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn mysql_hash_comment_quotes_cannot_expose_following_literals() {
+        for sql in [
+            "SELECT id, # 3\" pipe\n  'moved from tenant_acme' AS note FROM jobs",
+            "SELECT id, # 3` pipe\n  'moved from tenant_acme' AS note FROM jobs",
+            "SELECT id, # 3\" pipe\n  'it''s moved from tenant_acme' AS note FROM jobs",
+            r"SELECT id, # 3` pipe
+  'it\'s moved from tenant_acme' AS note FROM jobs",
+        ] {
+            assert_eq!(
+                super::summarize(sql, "mysql").as_deref(),
+                Some("SELECT jobs")
+            );
+        }
+    }
+
+    #[test]
+    fn postgres_hash_operator_does_not_hide_the_target() {
+        assert_eq!(
+            summarize("SELECT flags # 1 FROM users").as_deref(),
+            Some("SELECT users")
+        );
+    }
+
+    #[test]
+    fn backslash_escaped_literals_cannot_supply_targets() {
+        let sql = r"SELECT 'it\'s' AS a, 'x FROM hidden' AS b FROM users";
+        assert_eq!(
+            super::summarize(sql, "mysql").as_deref(),
+            Some("SELECT users")
+        );
+        let sql = r"SELECT E'it\'s FROM hidden' FROM users";
+        assert_eq!(summarize(sql).as_deref(), Some("SELECT users"));
+    }
+
+    #[test]
     fn preserves_qualified_and_quoted_targets() {
         assert_eq!(
             summarize(r#"SELECT * FROM "reporting"."daily orders" WHERE id = 42"#).as_deref(),
@@ -631,5 +721,192 @@ mod tests {
     fn recursive_cte_does_not_recurse_forever() {
         let sql = "WITH RECURSIVE loop AS (SELECT * FROM loop) SELECT * FROM loop";
         assert_eq!(summarize(sql).as_deref(), Some("SELECT loop"));
+    }
+
+    #[test]
+    fn cte_resolution_stops_at_the_depth_limit() {
+        // An acyclic chain distinguishes the depth guard from cycle detection.
+        let ctes = (0..18)
+            .map(|index| {
+                let target = if index == 17 {
+                    "physical_rows".to_owned()
+                } else {
+                    format!("cte_{}", index + 1)
+                };
+                format!("cte_{index} AS (SELECT * FROM {target})")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert_eq!(
+            summarize(&format!("WITH {ctes} SELECT * FROM cte_0")).as_deref(),
+            Some("SELECT cte_16")
+        );
+        assert_eq!(
+            summarize(&format!("WITH {ctes} SELECT * FROM cte_2")).as_deref(),
+            Some("SELECT physical_rows")
+        );
+    }
+
+    #[test]
+    fn cte_columns_and_materialization_preserve_the_source() {
+        for hint in ["", "MATERIALIZED", "NOT MATERIALIZED"] {
+            let sql = format!(
+                "WITH selected(id, label) AS {hint} \
+                 (SELECT id, COALESCE(label, 'anonymous') FROM users) \
+                 SELECT * FROM selected"
+            );
+            assert_eq!(summarize(&sql).as_deref(), Some("SELECT users"));
+        }
+    }
+
+    #[test]
+    fn nested_ctes_use_the_nearest_scope() {
+        let sql = "WITH source AS (SELECT * FROM outer_rows), \
+                   selected AS (WITH source AS (SELECT * FROM inner_rows) \
+                                SELECT * FROM source) \
+                   SELECT * FROM selected";
+        assert_eq!(summarize(sql).as_deref(), Some("SELECT inner_rows"));
+    }
+
+    #[test]
+    fn incomplete_cte_prefixes_have_no_summary() {
+        for sql in [
+            "WITH",
+            "WITH , SELECT * FROM users",
+            "WITH selected(id",
+            "WITH selected(id)",
+            "WITH selected AS",
+            "WITH selected AS MATERIALIZED",
+            "WITH selected AS (SELECT * FROM users",
+        ] {
+            assert_eq!(summarize(sql), None, "sql: {sql}");
+        }
+    }
+
+    #[test]
+    fn ddl_and_target_modifiers_preserve_object_names() {
+        for (sql, expected) in [
+            (
+                "ALTER TABLE ONLY users ADD COLUMN active boolean",
+                "ALTER users",
+            ),
+            ("DROP TABLE IF EXISTS users", "DROP users"),
+            (
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS users_idx ON users(id)",
+                "CREATE users_idx",
+            ),
+            ("TRUNCATE users", "TRUNCATE users"),
+            ("SELECT * FROM ONLY users", "SELECT users"),
+            ("UPDATE ONLY users SET active = true", "UPDATE users"),
+            ("COPY users TO STDOUT", "COPY users"),
+            ("EXECUTE refresh_users", "EXECUTE refresh_users"),
+        ] {
+            assert_eq!(summarize(sql).as_deref(), Some(expected), "sql: {sql}");
+        }
+    }
+
+    #[test]
+    fn commands_without_recognized_targets_use_only_the_operation() {
+        for (sql, expected) in [
+            ("CREATE EXTENSION example_extension", "CREATE"),
+            ("BEGIN", "BEGIN"),
+            ("COMMIT", "COMMIT"),
+            ("ROLLBACK", "ROLLBACK"),
+            ("EXPLAIN SELECT * FROM users", "EXPLAIN"),
+            ("SELECT * FROM WHERE secret = 'value'", "SELECT"),
+            ("SELECT * FROM users.", "SELECT"),
+        ] {
+            assert_eq!(summarize(sql).as_deref(), Some(expected), "sql: {sql}");
+        }
+        // Malformed qualification keeps the recognized prefix, not the clause/value.
+        assert_eq!(
+            summarize("SELECT * FROM users.WHERE secret = 'value'").as_deref(),
+            Some("SELECT users")
+        );
+    }
+
+    #[test]
+    fn comments_cannot_supply_a_target_or_a_second_statement() {
+        for sql in [
+            "-- SELECT * FROM secrets\nSELECT * FROM users",
+            "SELECT -- FROM secrets\n * FROM users",
+            "SELECT * FROM users -- FROM secrets",
+            "/* outer /* FROM secrets */ still a comment */ SELECT * FROM users",
+        ] {
+            assert_eq!(
+                summarize(sql).as_deref(),
+                Some("SELECT users"),
+                "sql: {sql}"
+            );
+        }
+        assert_eq!(
+            summarize("SELECT 1; SELECT * FROM secrets").as_deref(),
+            Some("SELECT")
+        );
+    }
+
+    #[test]
+    fn sqlite_bracket_identifiers_keep_delimiters() {
+        for (sql, expected) in [
+            ("SELECT * FROM [daily orders]", "SELECT [daily orders]"),
+            (
+                "SELECT * FROM [reporting].[daily orders]",
+                "SELECT [reporting].[daily orders]",
+            ),
+        ] {
+            assert_eq!(
+                super::summarize(sql, "sqlite").as_deref(),
+                Some(expected),
+                "sql: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn bracket_scanner_does_not_end_at_a_doubled_close() {
+        // Scanner characterization only: SQLite itself ends [...] at the first ].
+        assert_eq!(super::scan_bracket_identifier(b"[a]]b] tail", 0), 6);
+    }
+
+    #[test]
+    fn summary_limit_counts_utf8_bytes_and_preserves_complete_names() {
+        for target in ["x".repeat(248), format!("{}xx", "界".repeat(82))] {
+            let expected = format!("SELECT {target}");
+            assert_eq!(expected.len(), 255);
+            assert_eq!(
+                summarize(&format!("SELECT * FROM {target}")),
+                Some(expected)
+            );
+            assert_eq!(
+                summarize(&format!("SELECT * FROM {target}x")).as_deref(),
+                Some("SELECT")
+            );
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn generated_quoted_selects_summarize_to_operation_and_target(
+            target in "[a-z]{1,40}",
+            value in any::<i64>(),
+        ) {
+            for (system, quote) in [("postgresql", '"'), ("mysql", '`'), ("sqlite", '"')] {
+                let sql = format!("SELECT * FROM {quote}{target}{quote} WHERE id = {value}");
+                let expected = format!("SELECT {quote}{target}{quote}");
+                let summary = super::summarize(&sql, system);
+                prop_assert_eq!(summary.as_deref(), Some(expected.as_str()));
+            }
+        }
+
+        #[test]
+        fn arbitrary_and_structured_inputs_never_panic_or_exceed_summary_cap(sql in prop_oneof![
+                any::<String>(),
+                "[a-z_][a-z_0-9]{0,300}".prop_map(|target| format!("SELECT * FROM {target}")),
+            ]) {
+            for system in ["postgresql", "mysql", "sqlite"] {
+                let summary = super::summarize(&sql, system);
+                prop_assert!(summary.as_ref().is_none_or(|value| value.len() <= super::MAX_SUMMARY_BYTES));
+            }
+        }
     }
 }
