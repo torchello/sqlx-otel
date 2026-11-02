@@ -23,6 +23,17 @@ pub(crate) const LATENCY_BUCKETS_SECONDS: &[f64] = &[
     30.0, 60.0,
 ];
 
+/// Explicit bucket boundaries, in seconds, for `sqlx_otel.transaction.duration`.
+///
+/// The shared latency set, extended past 60 seconds. Unlike an acquisition, a transaction has no
+/// client-side timeout that caps it, and the batch transactions that run for minutes are exactly
+/// the ones holding a connection for longest, so they must not all collapse into the overflow
+/// bucket.
+pub(crate) const TRANSACTION_BUCKETS_SECONDS: &[f64] = &[
+    0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+    30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0,
+];
+
 /// Holds the OpenTelemetry metric instruments for per-operation recording.
 ///
 /// Created once per [`Pool`](crate::Pool) and shared (via `Arc`) across all wrapper types
@@ -91,7 +102,19 @@ impl Metrics {
 
 #[cfg(test)]
 mod tests {
-    use super::LATENCY_BUCKETS_SECONDS;
+    use super::{LATENCY_BUCKETS_SECONDS, TRANSACTION_BUCKETS_SECONDS};
+
+    /// The transaction set must stay comparable with `use_time` wherever the two ranges overlap,
+    /// and well-formed for an explicit-bucket histogram.
+    #[test]
+    fn transaction_buckets_extend_the_latency_set() {
+        assert!(TRANSACTION_BUCKETS_SECONDS.starts_with(LATENCY_BUCKETS_SECONDS));
+        assert!(
+            TRANSACTION_BUCKETS_SECONDS
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+        );
+    }
 
     /// The boundary set must be well-formed for an explicit-bucket histogram.
     ///
