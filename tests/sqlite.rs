@@ -197,6 +197,18 @@ async fn fetch_one_via_pool() {
 
 #[tokio::test]
 #[serial]
+async fn raw_sql_preserves_simple_protocol() {
+    test_raw_sql_preserves_simple_protocol!(test_pool().await, common::SQLITE_DIALECT);
+}
+
+#[tokio::test]
+#[serial]
+async fn owned_sql_string_query_text() {
+    test_owned_sql_string_query_text!(test_pool().await, common::SQLITE_DIALECT);
+}
+
+#[tokio::test]
+#[serial]
 async fn fetch_one_via_connection() {
     test_fetch_one_via_connection!(test_pool().await, common::SQLITE_DIALECT);
 }
@@ -397,6 +409,29 @@ async fn transaction_rollback() {
     test_transaction_rollback!(test_pool().await, common::SQLITE_DIALECT);
 }
 
+/// Returning an owned transaction must not borrow the pool handle. This helper
+/// deliberately requires the public API to preserve `SQLx`'s static lifetime.
+async fn owned_transaction(
+    pool: &Pool<Sqlite>,
+) -> Result<sqlx_otel::Transaction<'static, Sqlite>, sqlx::Error> {
+    pool.begin().await
+}
+
+#[tokio::test]
+#[serial]
+async fn pool_transaction_can_outlive_pool_handle() {
+    let mut transaction = {
+        let pool = test_pool().await;
+        owned_transaction(&pool).await.unwrap()
+    };
+
+    sqlx::query("SELECT 1")
+        .execute(&mut transaction)
+        .await
+        .unwrap();
+    transaction.rollback().await.unwrap();
+}
+
 // ===========================================================================
 // PoolBuilder with_* methods
 // ===========================================================================
@@ -485,6 +520,74 @@ async fn annotation_all_four_fields() {
 #[serial]
 async fn query_summary_drives_span_name() {
     test_query_summary_drives_span_name!(test_pool().await, common::SQLITE_DIALECT);
+}
+
+#[tokio::test]
+#[serial]
+async fn automatic_summaries_are_opt_in_and_group_without_literal_values() {
+    use sqlx_otel::{QueryAnnotations, QuerySummaryMode, QueryTextMode};
+
+    let tel = common::TestTelemetry::install();
+    let default_pool = PoolBuilder::from(raw_pool().await)
+        .with_query_text_mode(QueryTextMode::Off)
+        .build();
+    default_pool
+        .fetch_all("SELECT name FROM sqlite_master")
+        .await
+        .unwrap();
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(common::attr(&spans[0], "db.query.summary"), None);
+    tel.reset();
+
+    let pool = PoolBuilder::from(raw_pool().await)
+        .with_query_text_mode(QueryTextMode::Off)
+        .with_query_summary_mode(QuerySummaryMode::Auto)
+        .build();
+    for sql in [
+        "SELECT name FROM sqlite_master WHERE name = 'private_a'",
+        "SELECT name FROM sqlite_master WHERE name = 'private_b'",
+    ] {
+        sqlx::query(sql).fetch_all(&pool).await.unwrap();
+    }
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 2);
+    for span in &spans {
+        assert_eq!(span.name, "SELECT sqlite_master");
+        assert_eq!(
+            common::attr(span, "db.query.summary"),
+            Some("SELECT sqlite_master".into())
+        );
+        assert_eq!(common::attr(span, "db.query.text"), None);
+        assert_eq!(common::attr(span, "db.operation.name"), None);
+        assert_eq!(common::attr(span, "db.collection.name"), None);
+    }
+    let metrics = tel.metrics();
+    let point = common::find_histogram_data_point_with(
+        &metrics,
+        "db.client.operation.duration",
+        &[("db.query.summary", "SELECT sqlite_master")],
+    )
+    .unwrap();
+    assert_eq!(point.count(), 2);
+    tel.reset();
+
+    sqlx::query("SELECT name FROM sqlite_master")
+        .with_annotations(QueryAnnotations::new().query_summary("schema lookup"))
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].name, "schema lookup");
+    assert!(
+        common::find_histogram_data_point_with(
+            &tel.metrics(),
+            "db.client.operation.duration",
+            &[("db.query.summary", "schema lookup")],
+        )
+        .is_some()
+    );
 }
 
 // ===========================================================================

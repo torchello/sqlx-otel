@@ -81,7 +81,7 @@
 //! | `db.response.returned_rows` | Row count                                                | On `fetch*` methods         |
 //! | `db.response.affected_rows` | Rows affected (`QueryResult::rows_affected()`)           | On `execute` ([note](#a-note-on-dbresponseaffected_rows)) |
 //! | `db.response.status_code`   | SQLSTATE / driver error code                             | On database errors          |
-//! | `error.type`                | Error variant name                                       | On any error                |
+//! | `error.type`                | Database status code or canonical `SQLx` error variant   | On any error                |
 //!
 //! [annotated]: #per-query-annotations
 //!
@@ -111,16 +111,35 @@
 //! | `db.client.connection.idle.max`         | Gauge           |      | Maximum idle connections (equals `max` in `SQLx`)    |
 //! | `db.client.connection.idle.min`         | Gauge           |      | Configured minimum connections                       |
 //!
-//! Explicit acquisition, implicit pool queries (including annotated and streaming queries),
-//! and `begin()` share one instrumented acquisition. Queries within a transaction do not
-//! acquire again. Wait time covers completed acquisition attempts and excludes `BEGIN` and
-//! query execution. Caller cancellation clears pending without recording a completed wait
-//! or a pool timeout. Connection use time follows the lease through transaction completion.
-//! Pending and timeout series start at zero. Polling/export can miss brief gauge peaks.
-//! `connection.count` is polled by a background task and requires both
+//! Explicit acquisition, implicit pool queries (including annotated and streaming queries), and
+//! `begin()` share one instrumented acquisition; queries inside a transaction do not acquire
+//! again. Wait time covers completed acquisition attempts and excludes `BEGIN` and query
+//! execution. Caller cancellation clears pending without recording a completed wait or a pool
+//! timeout, since the pool never failed to deliver – the caller left. Only
+//! `sqlx::Error::PoolTimedOut` increments the timeout counter, so `PoolClosed` on shutdown does
+//! not inflate the timeout rate. Connection use time follows the lease through transaction
+//! completion. Pending and timeout series start at zero. Polling/export can miss brief gauge
+//! peaks. `connection.count` is polled by a background task and requires both
 //! [`PoolBuilder::with_pool_name`] and a runtime feature (`runtime-tokio` or
 //! `runtime-async-std`); without either, the gauge is silent. The remaining three are static
 //! gauges recorded once at [`PoolBuilder::build`].
+//!
+//! ## Histogram buckets
+//!
+//! `db.client.operation.duration`, `db.client.connection.wait_time`, and
+//! `db.client.connection.use_time` are recorded in seconds, as semconv requires. The `OTel` SDK's
+//! default bucket boundaries (`0, 5, 10, 25, ... 10000`) are shaped for milliseconds, so on a
+//! seconds-valued histogram every observation below five seconds collapses into one bucket and
+//! quantiles derived from it are interpolation artefacts rather than measurements. All three
+//! therefore ship explicit boundaries spanning sub-millisecond round trips up to the 30-second
+//! acquire timeout `SQLx` applies by default. The two row-count histograms are left on the SDK
+//! defaults, which suit counts already.
+//!
+//! These boundaries are instrument *advice*. The SDK applies advice only where no matching view
+//! has already set an aggregation, so an application that registers a `View` with a compatible
+//! explicit aggregation overrides them – this crate deliberately exposes no API of its own for
+//! retuning them. A view whose aggregation the SDK rejects as incompatible falls back to the
+//! implicit default view, which applies this advice after all. See the README for an example.
 //!
 //! ## A note on `db.response.affected_rows`
 //!
@@ -220,7 +239,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! sqlx-otel = { version = "0.1", features = ["postgres", "runtime-tokio"] }
+//! sqlx-otel = { version = "0.5", features = ["postgres", "runtime-tokio"] }
 //! ```
 //!
 //! All operation- and pool-level metrics other than `db.client.connection.count` work
@@ -228,7 +247,7 @@
 //!
 //! # MSRV
 //!
-//! Minimum supported Rust version: **1.85.0**.
+//! Minimum supported Rust version: **1.94.0**.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
@@ -245,6 +264,7 @@ mod pool;
 mod pool_executor;
 mod pool_metrics;
 mod query_ext;
+mod rebuilt_query;
 mod runtime;
 mod summary;
 mod transaction;

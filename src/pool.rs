@@ -518,8 +518,14 @@ impl<DB: Database> Pool<DB> {
     }
 }
 
-// A caller timeout or task abort may drop acquire() while it is still awaiting SQLx.
-// Keep pending truthful on that path without classifying caller cancellation as PoolTimedOut.
+/// Decrements `db.client.connection.pending_requests` on every exit path from
+/// [`Pool::acquire`].
+///
+/// A caller timeout or task abort can drop the `acquire()` future while it is still awaiting
+/// `SQLx`, which would otherwise leave the counter permanently incremented. Tying the decrement
+/// to a `Drop` guard covers success, error, and cancellation alike. Cancellation deliberately
+/// stops there: it records no completed wait and is not classified as `PoolTimedOut`, because
+/// the pool never failed to deliver – the caller left.
 struct PendingAcquisition<'a> {
     counter: &'a opentelemetry::metrics::UpDownCounter<i64>,
     attrs: &'a [opentelemetry::KeyValue],

@@ -191,10 +191,10 @@ pub fn find_duration_data_point(
                 if metric.name() != "db.client.operation.duration" {
                     continue;
                 }
-                if let AggregatedMetrics::F64(MetricData::Histogram(hist)) = metric.data() {
-                    if let Some(dp) = hist.data_points().next() {
-                        return Some(dp.clone());
-                    }
+                if let AggregatedMetrics::F64(MetricData::Histogram(hist)) = metric.data()
+                    && let Some(dp) = hist.data_points().next()
+                {
+                    return Some(dp.clone());
                 }
             }
         }
@@ -566,10 +566,15 @@ pub const MYSQL_DIALECT: Dialect = Dialect {
 macro_rules! fresh_table {
     ($pool:expr, $table:expr, $columns:expr) => {{
         use sqlx::Executor as _;
+        // `AssertSqlSafe` because a bare `&str` must be `'static`; these are built at runtime from
+        // test-controlled table and column names.
         let drop_sql = format!("DROP TABLE IF EXISTS {}", $table);
-        $pool.execute(drop_sql.as_str()).await.unwrap();
+        $pool.execute(sqlx::AssertSqlSafe(drop_sql)).await.unwrap();
         let create_sql = format!("CREATE TABLE {} ({})", $table, $columns);
-        $pool.execute(create_sql.as_str()).await.unwrap();
+        $pool
+            .execute(sqlx::AssertSqlSafe(create_sql))
+            .await
+            .unwrap();
     }};
 }
 
@@ -1588,6 +1593,61 @@ macro_rules! test_fetch_all_records_error {
     }};
 }
 
+/// `raw_sql` through the wrapper: the batch executes, and all of it reaches `db.query.text`.
+///
+/// This does not show that the simple query protocol was selected. `sqlx::query` passes here too,
+/// because `SQLite` tolerates multi-statement text on the prepared path. That `Ok(None)` and
+/// `persistent == false` round-trip is proved by `split_preserves_all_observables` in
+/// `src/rebuilt_query.rs`; this covers the wiring to it.
+#[macro_export]
+macro_rules! test_raw_sql_preserves_simple_protocol {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        (&pool)
+            .execute(sqlx::raw_sql("SELECT 1; SELECT 2;"))
+            .await
+            .expect("raw_sql batch must stay on the simple query protocol through the wrapper");
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.query.text"),
+            Some(opentelemetry::Value::String("SELECT 1; SELECT 2;".into())),
+            "the whole batch must reach db.query.text, not just the first statement"
+        );
+    }};
+}
+
+/// A query built from an owned `String` reports its SQL verbatim.
+///
+/// Runtime-built SQL arrives as `AssertSqlSafe`, a different `SqlStr` representation than a string
+/// literal. `db.query.text` must come out the same either way.
+#[macro_export]
+macro_rules! test_owned_sql_string_query_text {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let sql = format!("SELECT {}", 1);
+        (&pool)
+            .fetch_one(sqlx::AssertSqlSafe(sql.clone()))
+            .await
+            .unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.query.text"),
+            Some(opentelemetry::Value::String(sql.into())),
+        );
+    }};
+}
+
 /// `fetch_one` against the wrapped pool. Returns 1 row.
 #[macro_export]
 macro_rules! test_fetch_one_via_pool {
@@ -1896,7 +1956,10 @@ macro_rules! test_prepare_via_pool {
         let tel = $crate::common::TestTelemetry::install();
         let pool = $pool_factory;
 
-        let _stmt = (&pool).prepare("SELECT 1").await.unwrap();
+        let _stmt = (&pool)
+            .prepare(sqlx::SqlStr::from_static("SELECT 1"))
+            .await
+            .unwrap();
 
         let spans = tel.spans();
         assert_eq!(spans.len(), 1);
@@ -1904,13 +1967,13 @@ macro_rules! test_prepare_via_pool {
         assert!($crate::common::attr(&spans[0], "db.response.returned_rows").is_none());
 
         pool.with_annotations($crate::common::test_annotations())
-            .prepare("SELECT 1")
+            .prepare(sqlx::SqlStr::from_static("SELECT 1"))
             .await
             .unwrap();
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
 
         pool.with_operation("SELECT", "users")
-            .prepare("SELECT 1")
+            .prepare(sqlx::SqlStr::from_static("SELECT 1"))
             .await
             .unwrap();
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
@@ -1928,7 +1991,10 @@ macro_rules! test_prepare_via_connection {
         let pool = $pool_factory;
 
         let mut conn = pool.acquire().await.unwrap();
-        let _stmt = (&mut conn).prepare("SELECT 1").await.unwrap();
+        let _stmt = (&mut conn)
+            .prepare(sqlx::SqlStr::from_static("SELECT 1"))
+            .await
+            .unwrap();
 
         let spans = tel.spans();
         assert_eq!(spans.len(), 1);
@@ -1936,13 +2002,13 @@ macro_rules! test_prepare_via_connection {
         assert!($crate::common::attr(&spans[0], "db.response.returned_rows").is_none());
 
         conn.with_annotations($crate::common::test_annotations())
-            .prepare("SELECT 1")
+            .prepare(sqlx::SqlStr::from_static("SELECT 1"))
             .await
             .unwrap();
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
 
         conn.with_operation("SELECT", "users")
-            .prepare("SELECT 1")
+            .prepare(sqlx::SqlStr::from_static("SELECT 1"))
             .await
             .unwrap();
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
@@ -1960,15 +2026,18 @@ macro_rules! test_prepare_via_transaction {
         let pool = $pool_factory;
 
         let mut tx = pool.begin().await.unwrap();
-        let _stmt = (&mut tx).prepare("SELECT 1").await.unwrap();
+        let _stmt = (&mut tx)
+            .prepare(sqlx::SqlStr::from_static("SELECT 1"))
+            .await
+            .unwrap();
 
         tx.with_annotations($crate::common::test_annotations())
-            .prepare("SELECT 1")
+            .prepare(sqlx::SqlStr::from_static("SELECT 1"))
             .await
             .unwrap();
 
         tx.with_operation("SELECT", "users")
-            .prepare("SELECT 1")
+            .prepare(sqlx::SqlStr::from_static("SELECT 1"))
             .await
             .unwrap();
 
@@ -1994,7 +2063,9 @@ macro_rules! test_prepare_records_error {
         let pool = $pool_factory;
 
         let mut conn = pool.acquire().await.unwrap();
-        let result = (&mut conn).prepare("INVALID SQL GIBBERISH").await;
+        let result = (&mut conn)
+            .prepare(sqlx::SqlStr::from_static("INVALID SQL GIBBERISH"))
+            .await;
         assert!(result.is_err());
 
         let spans = tel.spans();
@@ -2005,7 +2076,7 @@ macro_rules! test_prepare_records_error {
 
         let result = conn
             .with_annotations($crate::common::test_annotations())
-            .prepare("INVALID SQL GIBBERISH")
+            .prepare(sqlx::SqlStr::from_static("INVALID SQL GIBBERISH"))
             .await;
         assert!(result.is_err());
         let last = tel.spans().last().unwrap().clone();
@@ -2014,7 +2085,7 @@ macro_rules! test_prepare_records_error {
 
         let result = conn
             .with_operation("SELECT", "users")
-            .prepare("INVALID SQL GIBBERISH")
+            .prepare(sqlx::SqlStr::from_static("INVALID SQL GIBBERISH"))
             .await;
         assert!(result.is_err());
         let last = tel.spans().last().unwrap().clone();
@@ -2034,7 +2105,10 @@ macro_rules! test_prepare_with_via_pool {
         let pool = $pool_factory;
 
         let _stmt = (&pool)
-            .prepare_with($dialect.prepare_with_select_sql, &[])
+            .prepare_with(
+                sqlx::SqlStr::from_static($dialect.prepare_with_select_sql),
+                &[],
+            )
             .await
             .unwrap();
 
@@ -2044,13 +2118,19 @@ macro_rules! test_prepare_with_via_pool {
         assert!($crate::common::attr(&spans[0], "db.response.returned_rows").is_none());
 
         pool.with_annotations($crate::common::test_annotations())
-            .prepare_with($dialect.prepare_with_select_sql, &[])
+            .prepare_with(
+                sqlx::SqlStr::from_static($dialect.prepare_with_select_sql),
+                &[],
+            )
             .await
             .unwrap();
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
 
         pool.with_operation("SELECT", "users")
-            .prepare_with($dialect.prepare_with_select_sql, &[])
+            .prepare_with(
+                sqlx::SqlStr::from_static($dialect.prepare_with_select_sql),
+                &[],
+            )
             .await
             .unwrap();
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
@@ -2069,7 +2149,10 @@ macro_rules! test_prepare_with_via_connection {
 
         let mut conn = pool.acquire().await.unwrap();
         let _stmt = (&mut conn)
-            .prepare_with($dialect.prepare_with_select_sql, &[])
+            .prepare_with(
+                sqlx::SqlStr::from_static($dialect.prepare_with_select_sql),
+                &[],
+            )
             .await
             .unwrap();
 
@@ -2079,13 +2162,19 @@ macro_rules! test_prepare_with_via_connection {
         assert!($crate::common::attr(&spans[0], "db.response.returned_rows").is_none());
 
         conn.with_annotations($crate::common::test_annotations())
-            .prepare_with($dialect.prepare_with_select_sql, &[])
+            .prepare_with(
+                sqlx::SqlStr::from_static($dialect.prepare_with_select_sql),
+                &[],
+            )
             .await
             .unwrap();
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
 
         conn.with_operation("SELECT", "users")
-            .prepare_with($dialect.prepare_with_select_sql, &[])
+            .prepare_with(
+                sqlx::SqlStr::from_static($dialect.prepare_with_select_sql),
+                &[],
+            )
             .await
             .unwrap();
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
@@ -2104,17 +2193,26 @@ macro_rules! test_prepare_with_via_transaction {
 
         let mut tx = pool.begin().await.unwrap();
         let _stmt = (&mut tx)
-            .prepare_with($dialect.prepare_with_select_sql, &[])
+            .prepare_with(
+                sqlx::SqlStr::from_static($dialect.prepare_with_select_sql),
+                &[],
+            )
             .await
             .unwrap();
 
         tx.with_annotations($crate::common::test_annotations())
-            .prepare_with($dialect.prepare_with_select_sql, &[])
+            .prepare_with(
+                sqlx::SqlStr::from_static($dialect.prepare_with_select_sql),
+                &[],
+            )
             .await
             .unwrap();
 
         tx.with_operation("SELECT", "users")
-            .prepare_with($dialect.prepare_with_select_sql, &[])
+            .prepare_with(
+                sqlx::SqlStr::from_static($dialect.prepare_with_select_sql),
+                &[],
+            )
             .await
             .unwrap();
 
@@ -2140,7 +2238,9 @@ macro_rules! test_prepare_with_records_error {
         let pool = $pool_factory;
 
         let mut conn = pool.acquire().await.unwrap();
-        let result = (&mut conn).prepare_with("INVALID SQL GIBBERISH", &[]).await;
+        let result = (&mut conn)
+            .prepare_with(sqlx::SqlStr::from_static("INVALID SQL GIBBERISH"), &[])
+            .await;
         assert!(result.is_err());
 
         let spans = tel.spans();
@@ -2151,7 +2251,7 @@ macro_rules! test_prepare_with_records_error {
 
         let result = conn
             .with_annotations($crate::common::test_annotations())
-            .prepare_with("INVALID SQL GIBBERISH", &[])
+            .prepare_with(sqlx::SqlStr::from_static("INVALID SQL GIBBERISH"), &[])
             .await;
         assert!(result.is_err());
         let last = tel.spans().last().unwrap().clone();
@@ -2160,7 +2260,7 @@ macro_rules! test_prepare_with_records_error {
 
         let result = conn
             .with_operation("SELECT", "users")
-            .prepare_with("INVALID SQL GIBBERISH", &[])
+            .prepare_with(sqlx::SqlStr::from_static("INVALID SQL GIBBERISH"), &[])
             .await;
         assert!(result.is_err());
         let last = tel.spans().last().unwrap().clone();
@@ -2179,7 +2279,10 @@ macro_rules! test_describe_via_pool {
         let tel = $crate::common::TestTelemetry::install();
         let pool = $pool_factory;
 
-        let _desc = (&pool).describe("SELECT 1").await.unwrap();
+        let _desc = (&pool)
+            .describe(sqlx::SqlStr::from_static("SELECT 1"))
+            .await
+            .unwrap();
 
         let spans = tel.spans();
         assert_eq!(spans.len(), 1);
@@ -2187,13 +2290,13 @@ macro_rules! test_describe_via_pool {
         assert!($crate::common::attr(&spans[0], "db.response.returned_rows").is_none());
 
         pool.with_annotations($crate::common::test_annotations())
-            .describe("SELECT 1")
+            .describe(sqlx::SqlStr::from_static("SELECT 1"))
             .await
             .unwrap();
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
 
         pool.with_operation("SELECT", "users")
-            .describe("SELECT 1")
+            .describe(sqlx::SqlStr::from_static("SELECT 1"))
             .await
             .unwrap();
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
@@ -2211,7 +2314,10 @@ macro_rules! test_describe_via_connection {
         let pool = $pool_factory;
 
         let mut conn = pool.acquire().await.unwrap();
-        let _desc = (&mut conn).describe("SELECT 1").await.unwrap();
+        let _desc = (&mut conn)
+            .describe(sqlx::SqlStr::from_static("SELECT 1"))
+            .await
+            .unwrap();
 
         let spans = tel.spans();
         assert_eq!(spans.len(), 1);
@@ -2219,13 +2325,13 @@ macro_rules! test_describe_via_connection {
         assert!($crate::common::attr(&spans[0], "db.response.returned_rows").is_none());
 
         conn.with_annotations($crate::common::test_annotations())
-            .describe("SELECT 1")
+            .describe(sqlx::SqlStr::from_static("SELECT 1"))
             .await
             .unwrap();
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
 
         conn.with_operation("SELECT", "users")
-            .describe("SELECT 1")
+            .describe(sqlx::SqlStr::from_static("SELECT 1"))
             .await
             .unwrap();
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
@@ -2243,15 +2349,18 @@ macro_rules! test_describe_via_transaction {
         let pool = $pool_factory;
 
         let mut tx = pool.begin().await.unwrap();
-        let _desc = (&mut tx).describe("SELECT 1").await.unwrap();
+        let _desc = (&mut tx)
+            .describe(sqlx::SqlStr::from_static("SELECT 1"))
+            .await
+            .unwrap();
 
         tx.with_annotations($crate::common::test_annotations())
-            .describe("SELECT 1")
+            .describe(sqlx::SqlStr::from_static("SELECT 1"))
             .await
             .unwrap();
 
         tx.with_operation("SELECT", "users")
-            .describe("SELECT 1")
+            .describe(sqlx::SqlStr::from_static("SELECT 1"))
             .await
             .unwrap();
 
@@ -2277,7 +2386,9 @@ macro_rules! test_describe_records_error {
         let pool = $pool_factory;
 
         let mut conn = pool.acquire().await.unwrap();
-        let result = (&mut conn).describe("INVALID SQL GIBBERISH").await;
+        let result = (&mut conn)
+            .describe(sqlx::SqlStr::from_static("INVALID SQL GIBBERISH"))
+            .await;
         assert!(result.is_err());
 
         let spans = tel.spans();
@@ -2288,7 +2399,7 @@ macro_rules! test_describe_records_error {
 
         let result = conn
             .with_annotations($crate::common::test_annotations())
-            .describe("INVALID SQL GIBBERISH")
+            .describe(sqlx::SqlStr::from_static("INVALID SQL GIBBERISH"))
             .await;
         assert!(result.is_err());
         let last = tel.spans().last().unwrap().clone();
@@ -2297,7 +2408,7 @@ macro_rules! test_describe_records_error {
 
         let result = conn
             .with_operation("SELECT", "users")
-            .describe("INVALID SQL GIBBERISH")
+            .describe(sqlx::SqlStr::from_static("INVALID SQL GIBBERISH"))
             .await;
         assert!(result.is_err());
         let last = tel.spans().last().unwrap().clone();
@@ -3732,7 +3843,10 @@ macro_rules! test_transaction_rollback {
 
         let mut tx = pool.begin().await.unwrap();
         let create_sql = format!("CREATE TABLE rollback_test (id {})", $dialect.id_pk_column);
-        (&mut tx).execute(create_sql.as_str()).await.unwrap();
+        (&mut tx)
+            .execute(sqlx::AssertSqlSafe(create_sql))
+            .await
+            .unwrap();
         tx.rollback().await.unwrap();
 
         let spans = tel.spans();

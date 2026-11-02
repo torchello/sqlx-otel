@@ -15,7 +15,7 @@ The wrapper talks to the [`opentelemetry`](https://docs.rs/opentelemetry) API di
 
 - **Spans on every operation.** Every `sqlx::Executor` method emits a `SpanKind::Client` span carrying the OTel database-spans recommended set: `db.system.name`, `db.namespace`, `server.address`/`port`, `network.peer.address`/`port`, `network.protocol.name`, `network.transport`, `db.client.connection.pool.name`, `db.query.text`, returned/affected row counts, and SQLSTATE / `error.type` on failure.
 - **Span/metric attribute parity.** The `db.client.operation.duration` histogram carries the same bounded attribute set as spans – every annotation, every error-path attribute, every connection-level attribute – so dashboards can slice query latency by operation verb, target collection, error class, or pool name. `db.query.text` is the only span attribute deliberately excluded from metrics for cardinality.
-- **Caller-supplied annotations.** The library does not parse SQL. Per-query attributes (`db.operation.name`, `db.collection.name`, `db.query.summary`, `db.stored_procedure.name`) come from a small annotation API.
+- **Caller-supplied annotations.** Per-query attributes (`db.operation.name`, `db.collection.name`, `db.query.summary`, `db.stored_procedure.name`) come from a small annotation API. Optional automatic query summaries provide a best-effort operation/target label when annotations are absent; SQL extraction is off by default.
 - **Three backends, one API.** Postgres, SQLite, and MySQL behind feature flags; the wrapper API is identical across all three.
 - **Drop-in.** `&Pool<DB>` implements `sqlx::Executor`, so existing call sites keep working unchanged.
 
@@ -28,7 +28,7 @@ The wrapper talks to the [`opentelemetry`](https://docs.rs/opentelemetry) API di
 
 ```toml
 [dependencies]
-sqlx-otel = { version = "0.2.0", features = ["postgres", "runtime-tokio"] }
+sqlx-otel = { version = "0.5.0", features = ["postgres", "runtime-tokio"] }
 ```
 
 ```rust
@@ -89,8 +89,8 @@ let pool = PoolBuilder::from(raw_pool)
 
 ## Automatic query summaries
 
-Enable conservative low-cardinality `db.query.summary` generation when a short operation
-name is useful for grouping:
+Automatic summaries are **off by default**. Enable best-effort `db.query.summary`
+generation when a short operation name is useful for grouping:
 
 ```rust
 use sqlx_otel::{PoolBuilder, QuerySummaryMode};
@@ -103,7 +103,16 @@ let pool = PoolBuilder::from(raw_pool)
 The summary contains only the outer operation and primary target, such as `SELECT users` or
 `INSERT orders`. Common table expressions are resolved to their primary physical target
 when possible. Predicates, selected columns, literal values, and bind parameters are never
-included. Explicit per-query annotations take precedence.
+included for supported SQL forms. The generated summary names the span and is attached to
+operation metrics, independently of `QueryTextMode` (including `Off`). It does not infer
+`db.operation.name` or `db.collection.name`.
+
+Any explicit per-query annotations take precedence and disable inference for that query,
+even if they do not set a summary. This is a lightweight extractor, not a complete SQL
+parser: unsupported forms may produce an operation-only summary or keep the existing
+generic span name. Summaries are capped at 255 bytes, falling back to the operation rather
+than truncating an identifier. Table/schema names still contribute to metric cardinality;
+use explicit summaries or keep this mode off for dynamically named or sensitive objects.
 
 ## Per-query annotations
 
@@ -190,7 +199,7 @@ Set on every `Executor` method (`execute`, `fetch`, `fetch_all`, `fetch_one`, `f
 | `db.query.text`                  | The SQL query string with inter-token whitespace collapsed  | Unless `QueryTextMode::Off` |
 | `db.operation.name`              | Database operation (e.g. `SELECT`)                          | When annotated              |
 | `db.collection.name`             | Target table or collection                                  | When annotated              |
-| `db.query.summary`               | Low-cardinality query summary                               | When annotated              |
+| `db.query.summary`               | Operation/target summary or explicit query summary           | When generated or annotated |
 | `db.stored_procedure.name`       | Stored procedure name                                       | When annotated              |
 | `db.response.returned_rows`      | Row count                                                   | On `fetch*` methods         |
 | `db.response.affected_rows`      | Rows affected (`rows_affected()`)                           | On `execute`                |
@@ -212,7 +221,7 @@ error variant name. An `exception` event is added with the canonical SQLx varian
 | `db.client.response.returned_rows` | Histogram |      | Number of rows returned per `fetch*` call     |
 | `db.client.response.affected_rows` | Histogram |      | Rows affected per `execute` call (custom)     |
 
-These mirror the bounded portion of the span attribute set: connection-level attributes (`db.system.name`, `db.namespace`, `server.address`/`port`, `network.peer.address`/`port`, `network.protocol.name`, `network.transport`, `db.client.connection.pool.name` – wherever set), plus annotation-derived attributes (`db.operation.name`, `db.collection.name`, `db.query.summary`, `db.stored_procedure.name`) when present, plus error-path attributes (`error.type`, plus `db.response.status_code` for `sqlx::Error::Database`) on the error path. `db.query.text` is deliberately excluded for cardinality; `db.query.summary` is caller-controlled and inherits its cardinality cost from the span side.
+These mirror the bounded portion of the span attribute set: connection-level attributes (`db.system.name`, `db.namespace`, `server.address`/`port`, `network.peer.address`/`port`, `network.protocol.name`, `network.transport`, `db.client.connection.pool.name` – wherever set), plus annotation-derived attributes (`db.operation.name`, `db.collection.name`, `db.query.summary`, `db.stored_procedure.name`) when present, plus error-path attributes (`error.type`, plus `db.response.status_code` for `sqlx::Error::Database`) on the error path. `db.query.text` is deliberately excluded for cardinality. Automatically generated `db.query.summary` values contain only an operation/target pair; dynamically named targets still contribute to metric cardinality. Explicit summaries remain caller-controlled and inherit their cardinality cost from the span side.
 
 `db.client.response.affected_rows` is not part of the OpenTelemetry semantic conventions – we ship it for the same reason as the matching span attribute: backends report a useful database-confirmed count that's worth slicing alongside duration. It is recorded only on `execute()` calls (where `QueryResult::rows_affected()` is meaningful) and is not recorded for `execute_many` (deprecated upstream).
 
@@ -229,32 +238,41 @@ These mirror the bounded portion of the span attribute set: connection-level att
 | `db.client.connection.idle.max`           | Gauge           |      | Maximum idle connections (equals `max` in SQLx)       |
 | `db.client.connection.idle.min`           | Gauge           |      | Configured minimum connections                        |
 
-Explicit `acquire()`, implicit pool queries (including annotated and streaming queries),
-and `begin()` share one instrumented acquisition. Queries within a transaction do not
-acquire again. Wait time covers completed acquisition attempts, including semaphore wait,
-connection creation and validation, but excludes query execution and `BEGIN`. Dropping a
-waiting future decrements pending requests without recording a completed wait or a pool
-timeout. Only `sqlx::Error::PoolTimedOut` increments the timeout counter. Pending and
-timeout series are initialized at zero; wait buckets resolve submillisecond acquisitions.
-Connection-use time follows the lease through transaction commit, rollback, or drop.
+Explicit `acquire()`, implicit pool queries (including annotated and streaming queries), and `begin()` share one instrumented acquisition; queries issued inside a transaction do not acquire again. Wait time covers completed acquisition attempts – semaphore wait, connection creation, and validation – but excludes `BEGIN` and query execution. Dropping a waiting future decrements pending requests without recording a completed wait or a timeout, since the pool never failed to deliver: the caller left. Only `sqlx::Error::PoolTimedOut` increments the timeout counter, so `PoolClosed` on shutdown does not inflate your timeout rate. Pending-request and timeout series are initialised at zero so dashboards start from a known baseline rather than waiting for the first event. Connection use time follows the lease through transaction commit, rollback, or drop.
 
-All three latency histograms (`db.client.operation.duration`,
-`db.client.connection.wait_time`, and `db.client.connection.use_time`) use explicit
-boundaries in seconds:
+`db.client.connection.count` is polled by a background task and requires both a runtime feature (`runtime-tokio` or `runtime-async-std`) and a pool name set via `PoolBuilder::with_pool_name`. Polling and export intervals can miss brief utilisation or pending-request peaks. The remaining three are static gauges recorded once at construction.
+
+### Histogram buckets
+
+The three latency histograms – `db.client.operation.duration`, `db.client.connection.wait_time`, and `db.client.connection.use_time` – are recorded in seconds, as the semantic conventions require. The OpenTelemetry SDK's default bucket boundaries (`0, 5, 10, 25, … 10000`) are shaped for milliseconds, so on a seconds-valued histogram every observation below five seconds falls into a single bucket and any quantile derived from it is an interpolation artefact rather than a measurement. The crate therefore ships explicit boundaries spanning the range a database client actually occupies, from sub-millisecond local round trips up to the 30-second acquire timeout SQLx applies by default:
 
 ```text
 0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1,
-0.25, 0.5, 1, 2.5, 5, 10, 30, 60
+0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0
 ```
 
-This preserves resolution for subsecond operations instead of grouping them into the
-SDK's default `(0, 5]` bucket. Applications can override this instrument advice with
-an OpenTelemetry SDK View. Row-count histograms retain their default boundaries.
+These are instrument *advice*, not a fixed configuration. The SDK applies advice only when no matching view has already set an aggregation, so an application that registers a `View` with its own explicit bucket boundaries overrides what the crate ships – no API is needed from this crate to retune them. (A view whose aggregation the SDK rejects as incompatible with the instrument is discarded, and the crate's advice applies after all, so match histogram names only.)
 
-`db.client.connection.count` is polled by a background task and requires both a runtime
-feature (`runtime-tokio` or `runtime-async-std`) and a pool name set via
-`PoolBuilder::with_pool_name`. Polling and export intervals can miss brief utilization or
-pending-request peaks. The remaining three are static gauges recorded once at construction.
+```rust,ignore
+use opentelemetry_sdk::metrics::{Aggregation, Instrument, SdkMeterProvider, Stream};
+
+let provider = SdkMeterProvider::builder()
+    .with_reader(reader)
+    .with_view(|i: &Instrument| {
+        (i.name() == "db.client.operation.duration").then(|| {
+            Stream::builder()
+                .with_aggregation(Aggregation::ExplicitBucketHistogram {
+                    boundaries: vec![0.005, 0.05, 0.5, 5.0],
+                    record_min_max: true,
+                })
+                .build()
+                .unwrap()
+        })
+    })
+    .build();
+```
+
+The two row-count histograms (`db.client.response.returned_rows` and `db.client.response.affected_rows`) are left on the SDK defaults, which are already reasonable for counts.
 
 ## Backend support
 
@@ -268,9 +286,37 @@ pending-request peaks. The remaining three are static gauges recorded once at co
 
 ## Compatibility
 
-- **MSRV:** Rust **1.85.0**.
-- **SQLx:** `0.8.x`.
-- **OpenTelemetry:** `0.32.x`.
+| sqlx-otel | sqlx    | opentelemetry | MSRV     |
+| --------- | ------- | ------------- | -------- |
+| `0.5.x`   | `0.9.x` | `0.32.x`      | `1.94.0` |
+| `0.4.x`   | `0.8.x` | `0.32.x`      | `1.85.0` |
+| `0.3.x`   | `0.8.x` | `0.31.x`      | `1.85.0` |
+| `0.2.x`   | `0.8.x` | `0.31.x`      | `1.85.0` |
+| `0.1.x`   | `0.8.x` | `0.31.x`      | `1.85.0` |
+
+Pick the row matching the `sqlx` and `opentelemetry` versions your application already uses. Older releases stay on crates.io indefinitely and are never yanked, so pinning to an earlier row is a supported way to stay put.
+
+When pinning SQLx to a Git revision, patch the complete SQLx package family from the
+workspace root (`sqlx`, `sqlx-core`, the enabled driver crates, `sqlx-macros`, and
+`sqlx-macros-core`) so this wrapper and the application share one source and one
+`sqlx-core`. The wrapper enables `offline` on its selected drivers for `Executor::describe`;
+if the application enables another driver outside the wrapper's backend features, enable
+that driver's `offline` feature too. Check source and feature unification with
+`cargo tree -i sqlx-core -e features` before adopting a pin.
+
+## Versioning policy
+
+`sqlx` and `opentelemetry` are both pre-1.0, so Cargo compares their *minor* version for compatibility: `0.31` and `0.32` are separate ranges that never unify, whether or not the release actually changed anything. If your application's versions drift from the ones sqlx-otel was built against, Cargo resolves both copies into the build graph, and the two libraries fail differently.
+
+**`sqlx` fails at compile time.** Its types are part of this crate's public API, and types from semver-incompatible releases are distinct types. A `Pool` from `sqlx` `0.9` will not go into a wrapper built against `sqlx` `0.8`.
+
+**`opentelemetry` fails silently at runtime.** It coordinates through process-global state, so two copies means two registries. Your application installs its provider in one; the wrapper emits into the other. Spans and metrics disappear, with no error and no warning.
+
+Hence:
+
+- Either library bumping its minor triggers a minor release here.
+- Bugs are not backported. Fixes ship in the next release.
+- MSRV tracks [sqlx's MSRV policy](https://github.com/transact-rs/sqlx/blob/main/FAQ.md#MSRV).
 
 ## License
 

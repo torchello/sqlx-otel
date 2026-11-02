@@ -44,7 +44,7 @@ async fn shared_container() -> &'static SharedContainer {
                 .with_env_var("MYSQL_ROOT_PASSWORD", "test")
                 .with_env_var("MYSQL_DATABASE", "testdb")
                 .with_env_var("MYSQL_ALLOW_EMPTY_PASSWORD", "no")
-                .with_startup_timeout(Duration::from_secs(120))
+                .with_startup_timeout(Duration::from_mins(2))
                 .start()
                 .await
                 .expect("starting mysql container");
@@ -63,11 +63,13 @@ async fn shared_container() -> &'static SharedContainer {
 
 /// Stop and remove the shared container at process exit. Required because the
 /// `ContainerAsync` value lives in a `'static` (`CONTAINER`), so the language never
-/// runs its `Drop`. Using `ctor::dtor` schedules a synchronous shell-out to
+/// runs its `Drop`. Using `dtor::dtor` schedules a synchronous shell-out to
 /// `docker rm -f` that fires after `main` returns – equivalent to the per-test
-/// RAII cleanup that existed before the shared-container refactor (commit c29f995).
-#[ctor::dtor]
-fn drop_container() {
+/// RAII cleanup that existed before the shared-container refactor (commit c29f995). The fn is
+/// `unsafe` because `dtor` runs it outside the Rust runtime, where most std facilities carry no
+/// guarantees; spawning a subprocess and reading a `OnceLock` is safe in practice.
+#[dtor::dtor]
+unsafe fn drop_container() {
     if let Some(id) = CONTAINER_ID.get() {
         let _ = std::process::Command::new("docker")
             .args(["rm", "-f", id.as_str()])
@@ -255,6 +257,18 @@ async fn fetch_all_records_error() {
 #[serial]
 async fn fetch_one_via_pool() {
     test_fetch_one_via_pool!(test_pool().await, common::MYSQL_DIALECT);
+}
+
+#[tokio::test]
+#[serial]
+async fn raw_sql_preserves_simple_protocol() {
+    test_raw_sql_preserves_simple_protocol!(test_pool().await, common::MYSQL_DIALECT);
+}
+
+#[tokio::test]
+#[serial]
+async fn owned_sql_string_query_text() {
+    test_owned_sql_string_query_text!(test_pool().await, common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
