@@ -6,6 +6,51 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Implicit pool queries and `Pool::begin()` now route through the instrumented `Pool::acquire()`, so `db.client.connection.wait_time`, `use_time`, `pending_requests`, and `timeouts` account for every acquisition rather than only explicit `acquire()` calls. A workload written as `query(..).fetch_one(&pool)` previously borrowed its connection straight from `sqlx::Pool` and could saturate the pool without any of its waits or timeouts reaching telemetry. Queries issued inside a transaction still acquire once, and connection use time now follows the lease through transaction commit, rollback, or drop ([#40](https://github.com/chmodas/sqlx-otel/pull/40)).
+- Dropping an in-flight `acquire()` – a caller timeout or an aborted task – no longer leaves `db.client.connection.pending_requests` permanently incremented. The decrement moved to a `Drop` guard covering success, error, and cancellation alike. Cancellation records neither a completed wait nor a pool timeout, because the pool did not fail to deliver; only `sqlx::Error::PoolTimedOut` increments the timeout counter, so `PoolClosed` during shutdown no longer inflates the timeout rate ([#40](https://github.com/chmodas/sqlx-otel/pull/40)).
+
+### Changed
+
+- `db.client.connection.wait_time` declares explicit bucket boundaries instead of inheriting the OpenTelemetry SDK defaults ([#40](https://github.com/chmodas/sqlx-otel/pull/40)), and `db.client.operation.duration` and `db.client.connection.use_time` now use the same set ([#42](https://github.com/chmodas/sqlx-otel/pull/42)). The SDK defaults (`0, 5, 10, 25, … 10000`) are shaped for milliseconds, but semconv requires these histograms be recorded in seconds, so every observation below five seconds landed in a single bucket and any quantile computed from it was an interpolation artefact rather than a measurement. The boundaries run from `0.0001` to `60.0` seconds, covering sub-millisecond local round trips through the 30-second acquire timeout SQLx applies by default. **Dashboards and recording rules reading these histograms will see their bucket layout change.** The row-count histograms `db.client.response.returned_rows` and `db.client.response.affected_rows` keep the SDK defaults, which already suit counts. The boundaries are instrument advice, so an application that registers a `View` with a compatible explicit aggregation overrides them and the crate exposes no API of its own for retuning; the README carries a worked example ([#42](https://github.com/chmodas/sqlx-otel/pull/42)).
+- `db.client.connection.pending_requests` and `db.client.connection.timeouts` are initialised at zero when the pool is built, so both series exist from startup instead of appearing only after the first waiting caller or first timeout ([#40](https://github.com/chmodas/sqlx-otel/pull/40)).
+
+## Unreleased — fork integration
+
+### Added
+
+- Opt-in automatic query summaries (`QuerySummaryMode::Auto`) retain operation and
+  target labels without literal values, preserving the fork's SQL summaries on SQLx 0.9.
+
+### Changed
+
+- Automatic summaries now keep physical write targets when a common table expression
+  shadows the target name. For example, `WITH reports AS (SELECT id FROM source)
+  UPDATE reports SET id = 1` changes from `UPDATE source` to `UPDATE reports` relative to
+  the previous fork pin. Span names and `db.query.summary` metric series change accordingly.
+- Preserve the fork's database error classification: `error.type` uses the driver status
+  code when available and otherwise the canonical `sqlx::Error::<Variant>` name;
+  `exception.type` always uses the canonical SQLx variant.
+
+## [0.5.0] – 2026-08-09
+
+### Changed
+
+- **BREAKING:** Upgraded to `sqlx` `0.9`, which raised the minimum supported Rust version from `1.85.0` to `1.94.0`.
+
+## [0.4.0] – 2026-08-08
+
+### Changed
+
+- **Action required:** Upgraded to `opentelemetry` and `opentelemetry-semantic-conventions` `0.32`. Applications must move their own `opentelemetry` and `opentelemetry_sdk` to `0.32` as well, or spans and metrics stop being emitted.
+
+### Fixed
+
+- The pool-metrics polling task no longer stops when a single cloned `Pool` is dropped. All clones share one `Arc<AtomicBool>` shutdown flag, so the first clone to drop was flipping it and silently ending `db.client.connection.*` collection for every surviving clone. The task now stops only once the last clone is dropped, matching what the documentation already implied.
+
+## [0.3.0] – 2026-05-05
+
 ### Added
 
 - `db.client.response.affected_rows` histogram – a custom metric (no OTel semconv equivalent) mirroring the existing `db.response.affected_rows` span attribute. Recorded on `execute()` calls; carries the same connection / annotation / error attribute set as the duration histogram so dashboards can slice mutation throughput by the same dimensions ([#33](https://github.com/chmodas/sqlx-otel/pull/33)).
@@ -13,12 +58,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- Updated `opentelemetry`, `opentelemetry-semantic-conventions`, and the test SDK to
-  `0.32.x`.
-- `error.type` now matches `db.response.status_code` for database errors when the driver
-  provides a code, as required by the database client semantic conventions. Other errors
-  use their canonical `sqlx::Error::<Variant>` name; `exception.type` remains the canonical
-  SQLx variant rather than a database status code.
 - `db.client.connection.pool.name` previously appeared only on the `db.client.connection.count` gauge; it now also propagates to spans, the `db.client.operation.duration` / `db.client.response.returned_rows` histograms, and the rest of the `db.client.connection.*` family via the shared connection-attribute set. The `count` gauge's attribute set is unchanged ([#32](https://github.com/chmodas/sqlx-otel/pull/32)).
 - `db.query.text` now collapses inter-token whitespace runs to a single space and trims leading/trailing whitespace for both `QueryTextMode::Full` (default) and `QueryTextMode::Obfuscated`. Whitespace inside string literals, quoted identifiers, dollar-quoted bodies, and comments is preserved verbatim. Multi-line SQL written for source-level readability now renders as a single readable line in OTel exports without the embedded `\n` and indentation runs that came from source-level formatting. `QueryTextMode::Off` is unchanged ([#34](https://github.com/chmodas/sqlx-otel/pull/34)).
 
@@ -52,6 +91,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - SQLite backend ([#3](https://github.com/chmodas/sqlx-otel/pull/3)).
 - Backend-agnostic instrumentation core: `Pool`, `PoolBuilder`, `Transaction`, `PoolConnection`, and the `Executor` trait wiring that emits OpenTelemetry-native spans and metrics following the [database calls and systems](https://opentelemetry.io/docs/specs/semconv/db/) semantic conventions ([#2](https://github.com/chmodas/sqlx-otel/pull/2)).
 
-[Unreleased]: https://github.com/chmodas/sqlx-otel/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/chmodas/sqlx-otel/releases/tag/v0.1.0
 [0.2.0]: https://github.com/chmodas/sqlx-otel/releases/tag/v0.2.0
+[0.3.0]: https://github.com/chmodas/sqlx-otel/releases/tag/v0.3.0
+[0.4.0]: https://github.com/chmodas/sqlx-otel/releases/tag/v0.4.0
+[0.5.0]: https://github.com/chmodas/sqlx-otel/releases/tag/v0.5.0

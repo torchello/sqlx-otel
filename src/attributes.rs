@@ -58,6 +58,10 @@ pub enum QueryTextMode {
 /// possible. Literal values, predicates, selected columns, and bind parameters are never
 /// included.
 ///
+/// This is a best-effort extractor, not a complete SQL parser. Dynamic object names still
+/// contribute to metric cardinality. Keep this mode off or supply explicit annotations if
+/// object names are sensitive or unbounded.
+///
 /// Configured via
 /// [`PoolBuilder::with_query_summary_mode`](crate::PoolBuilder::with_query_summary_mode).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

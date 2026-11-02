@@ -98,8 +98,8 @@ fn start_span(name: &str, span_attrs: Vec<KeyValue>) -> (OtelContext, Instant) {
 /// attributes plus the four annotation-derived attributes when present, plus error-path attributes
 /// (`error.type`, `db.response.status_code`) appended later by `record_error`. The unbounded
 /// `db.query.text` attribute is deliberately excluded. Automatically generated
-/// `db.query.summary` values contain only a bounded operation/target pair; explicit summaries
-/// remain caller-controlled, so their cardinality cost is inherited from the span side.
+/// `db.query.summary` values contain an operation/target pair; dynamically named targets still contribute to
+/// cardinality. Explicit summaries remain caller-controlled.
 fn begin_query_span(
     attrs: &ConnectionAttributes,
     sql: Option<&str>,
@@ -160,10 +160,10 @@ fn exception_type(err: &sqlx::Error) -> &'static str {
 /// take precedence over the generic `SQLx` error variant. Non-database errors and database
 /// errors without a code fall back to their canonical `SQLx` variant name.
 fn error_type(err: &sqlx::Error) -> Cow<'static, str> {
-    if let sqlx::Error::Database(db_err) = err {
-        if let Some(code) = db_err.code() {
-            return Cow::Owned(code.into_owned());
-        }
+    if let sqlx::Error::Database(db_err) = err
+        && let Some(code) = db_err.code()
+    {
+        return Cow::Owned(code.into_owned());
     }
     Cow::Borrowed(exception_type(err))
 }
@@ -189,15 +189,15 @@ fn record_error(cx: &OtelContext, err: &sqlx::Error, metric_attrs: &mut Vec<KeyV
         error_type.as_ref().to_owned(),
     ));
     // Extract SQLSTATE or database-specific error code when available.
-    if let sqlx::Error::Database(db_err) = err {
-        if let Some(code) = db_err.code() {
-            let code = code.into_owned();
-            span.set_attribute(KeyValue::new(
-                attribute::DB_RESPONSE_STATUS_CODE,
-                code.clone(),
-            ));
-            metric_attrs.push(KeyValue::new(attribute::DB_RESPONSE_STATUS_CODE, code));
-        }
+    if let sqlx::Error::Database(db_err) = err
+        && let Some(code) = db_err.code()
+    {
+        let code = code.into_owned();
+        span.set_attribute(KeyValue::new(
+            attribute::DB_RESPONSE_STATUS_CODE,
+            code.clone(),
+        ));
+        metric_attrs.push(KeyValue::new(attribute::DB_RESPONSE_STATUS_CODE, code));
     }
     span.add_event(
         "exception",
@@ -429,10 +429,10 @@ macro_rules! impl_executor {
                 E: 'q + sqlx::Execute<'q, DB>,
                 'c: 'e,
             {
-                let sql = query.sql().to_owned();
+                let query = crate::rebuilt_query::RebuiltQuery::<DB>::split(query);
                 let state = $self_.state.clone();
                 let (cx, start, mut metric_attrs) =
-                    begin_query_span(&state.attrs, Some(&sql), $ann);
+                    begin_query_span(&state.attrs, Some(query.sql_str()), $ann);
                 let fut = ($inner).execute(query);
                 Box::pin(async move {
                     let result = fut.await;
@@ -462,10 +462,10 @@ macro_rules! impl_executor {
                 E: 'q + sqlx::Execute<'q, DB>,
                 'c: 'e,
             {
-                let sql = query.sql().to_owned();
+                let query = crate::rebuilt_query::RebuiltQuery::<DB>::split(query);
                 let state = $self_.state.clone();
                 let (cx, start, metric_attrs) =
-                    begin_query_span(&state.attrs, Some(&sql), $ann);
+                    begin_query_span(&state.attrs, Some(query.sql_str()), $ann);
                 let stream = ($inner).execute_many(query);
                 Box::pin(InstrumentedStream::<_, CountNone>::new(
                     stream,
@@ -485,10 +485,10 @@ macro_rules! impl_executor {
                 E: 'q + sqlx::Execute<'q, DB>,
                 'c: 'e,
             {
-                let sql = query.sql().to_owned();
+                let query = crate::rebuilt_query::RebuiltQuery::<DB>::split(query);
                 let state = $self_.state.clone();
                 let (cx, start, metric_attrs) =
-                    begin_query_span(&state.attrs, Some(&sql), $ann);
+                    begin_query_span(&state.attrs, Some(query.sql_str()), $ann);
                 let stream = ($inner).fetch(query);
                 Box::pin(InstrumentedStream::<_, CountAll>::new(
                     stream,
@@ -518,10 +518,10 @@ macro_rules! impl_executor {
                 E: 'q + sqlx::Execute<'q, DB>,
                 'c: 'e,
             {
-                let sql = query.sql().to_owned();
+                let query = crate::rebuilt_query::RebuiltQuery::<DB>::split(query);
                 let state = $self_.state.clone();
                 let (cx, start, metric_attrs) =
-                    begin_query_span(&state.attrs, Some(&sql), $ann);
+                    begin_query_span(&state.attrs, Some(query.sql_str()), $ann);
                 let stream = ($inner).fetch_many(query);
                 Box::pin(InstrumentedStream::<_, CountRight>::new(
                     stream,
@@ -545,10 +545,10 @@ macro_rules! impl_executor {
                 E: 'q + sqlx::Execute<'q, DB>,
                 'c: 'e,
             {
-                let sql = query.sql().to_owned();
+                let query = crate::rebuilt_query::RebuiltQuery::<DB>::split(query);
                 let state = $self_.state.clone();
                 let (cx, start, mut metric_attrs) =
-                    begin_query_span(&state.attrs, Some(&sql), $ann);
+                    begin_query_span(&state.attrs, Some(query.sql_str()), $ann);
                 let fut = ($inner).fetch_all(query);
                 Box::pin(async move {
                     let result = fut.await;
@@ -579,10 +579,10 @@ macro_rules! impl_executor {
                 E: 'q + sqlx::Execute<'q, DB>,
                 'c: 'e,
             {
-                let sql = query.sql().to_owned();
+                let query = crate::rebuilt_query::RebuiltQuery::<DB>::split(query);
                 let state = $self_.state.clone();
                 let (cx, start, mut metric_attrs) =
-                    begin_query_span(&state.attrs, Some(&sql), $ann);
+                    begin_query_span(&state.attrs, Some(query.sql_str()), $ann);
                 let fut = ($inner).fetch_one(query);
                 Box::pin(async move {
                     let result = fut.await;
@@ -612,10 +612,10 @@ macro_rules! impl_executor {
                 E: 'q + sqlx::Execute<'q, DB>,
                 'c: 'e,
             {
-                let sql = query.sql().to_owned();
+                let query = crate::rebuilt_query::RebuiltQuery::<DB>::split(query);
                 let state = $self_.state.clone();
                 let (cx, start, mut metric_attrs) =
-                    begin_query_span(&state.attrs, Some(&sql), $ann);
+                    begin_query_span(&state.attrs, Some(query.sql_str()), $ann);
                 let fut = ($inner).fetch_optional(query);
                 Box::pin(async move {
                     let result = fut.await;
@@ -642,18 +642,19 @@ macro_rules! impl_executor {
             ///
             /// This explicit API is provided to allow access to the statement metadata
             /// available after it prepared but before the first row is returned.
-            fn prepare<'e, 'q: 'e>(
+            fn prepare<'e>(
                 $self_,
-                query: &'q str,
+                query: sqlx::SqlStr,
             ) -> futures::future::BoxFuture<
                 'e,
-                Result<<DB as sqlx::Database>::Statement<'q>, sqlx::Error>,
+                Result<<DB as sqlx::Database>::Statement, sqlx::Error>,
             >
             where
                 'c: 'e,
             {
                 let state = $self_.state.clone();
-                let (cx, start, metric_attrs) = begin_query_span(&state.attrs, Some(query), $ann);
+                let (cx, start, metric_attrs) =
+                    begin_query_span(&state.attrs, Some(query.as_str()), $ann);
                 let fut = ($inner).prepare(query);
                 Box::pin(execute_instrumented(
                     fut, cx, start, state.metrics, metric_attrs,
@@ -665,19 +666,20 @@ macro_rules! impl_executor {
             ///
             /// Only some database drivers (Postgres, MSSQL) can take advantage of
             /// this extra information to influence parameter type inference.
-            fn prepare_with<'e, 'q: 'e>(
+            fn prepare_with<'e>(
                 $self_,
-                sql: &'q str,
+                sql: sqlx::SqlStr,
                 parameters: &'e [<DB as sqlx::Database>::TypeInfo],
             ) -> futures::future::BoxFuture<
                 'e,
-                Result<<DB as sqlx::Database>::Statement<'q>, sqlx::Error>,
+                Result<<DB as sqlx::Database>::Statement, sqlx::Error>,
             >
             where
                 'c: 'e,
             {
                 let state = $self_.state.clone();
-                let (cx, start, metric_attrs) = begin_query_span(&state.attrs, Some(sql), $ann);
+                let (cx, start, metric_attrs) =
+                    begin_query_span(&state.attrs, Some(sql.as_str()), $ann);
                 let fut = ($inner).prepare_with(sql, parameters);
                 Box::pin(execute_instrumented(
                     fut, cx, start, state.metrics, metric_attrs,
@@ -688,11 +690,13 @@ macro_rules! impl_executor {
             /// and results.
             ///
             /// This is used by compile-time verification in the query macros to
-            /// power their type inference.
+            /// power their type inference. The macros call it on a connection they open
+            /// themselves from `DATABASE_URL`, never through this wrapper, so a span emitted
+            /// here is always a caller invoking `describe` at runtime against a live pool.
             #[doc(hidden)]
-            fn describe<'e, 'q: 'e>(
+            fn describe<'e>(
                 $self_,
-                sql: &'q str,
+                sql: sqlx::SqlStr,
             ) -> futures::future::BoxFuture<
                 'e,
                 Result<sqlx::Describe<DB>, sqlx::Error>,
@@ -701,7 +705,8 @@ macro_rules! impl_executor {
                 'c: 'e,
             {
                 let state = $self_.state.clone();
-                let (cx, start, metric_attrs) = begin_query_span(&state.attrs, Some(sql), $ann);
+                let (cx, start, metric_attrs) =
+                    begin_query_span(&state.attrs, Some(sql.as_str()), $ann);
                 let fut = ($inner).describe(sql);
                 Box::pin(execute_instrumented(
                     fut, cx, start, state.metrics, metric_attrs,
@@ -936,7 +941,7 @@ mod tests {
         let (_, _, metric_attrs) = begin_query_span(
             &attrs,
             Some(
-                "WITH source_rows AS (SELECT id FROM data_ba_event WHERE token = 'secret') \
+                "WITH source_rows AS (SELECT id FROM events WHERE token = 'secret') \
                  SELECT COUNT(*) FROM source_rows",
             ),
             None,
@@ -947,7 +952,7 @@ mod tests {
             .map(|kv| kv.value.clone());
         assert_eq!(
             summary,
-            Some(opentelemetry::Value::String("SELECT data_ba_event".into()))
+            Some(opentelemetry::Value::String("SELECT events".into()))
         );
     }
 

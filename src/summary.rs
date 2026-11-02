@@ -62,6 +62,10 @@ fn summarize_tokens(
     let (local_ctes, statement_start) = parse_ctes(tokens);
     let (operation, operation_index) = find_operation(tokens, statement_start)?;
     let target = find_target(tokens, operation_index, &operation).map(|target| {
+        // A write target names the physical object even when a CTE shadows its name.
+        if !operation.eq_ignore_ascii_case("SELECT") {
+            return target;
+        }
         resolve_cte_target(
             target,
             &local_ctes,
@@ -522,19 +526,19 @@ mod tests {
         let sql = r"
             WITH source_rows AS (
                 SELECT event.id
-                FROM data_ba_event event
-                JOIN data_ba_league league ON league.id = event.league_id
+                FROM events event
+                JOIN leagues league ON league.id = event.league_id
             )
             SELECT COUNT(*) FROM source_rows
         ";
-        assert_eq!(summarize(sql).as_deref(), Some("SELECT data_ba_event"));
+        assert_eq!(summarize(sql).as_deref(), Some("SELECT events"));
     }
 
     #[test]
     fn resolves_chained_ctes() {
         let sql = r"
             WITH baseline AS (
-                SELECT id FROM data_ba_event
+                SELECT id FROM events
             ),
             source_rows AS (
                 SELECT id FROM baseline
@@ -544,20 +548,30 @@ mod tests {
             )
             SELECT COUNT(*) FROM evaluated
         ";
-        assert_eq!(summarize(sql).as_deref(), Some("SELECT data_ba_event"));
+        assert_eq!(summarize(sql).as_deref(), Some("SELECT events"));
     }
 
     #[test]
     fn insert_with_ctes_keeps_outer_write_target() {
         let sql = r"
-            WITH baseline AS (SELECT id FROM data_ba_event)
-            INSERT INTO normalized_event_state_artifact(event_id)
+            WITH baseline AS (SELECT id FROM events)
+            INSERT INTO event_reports(event_id)
             SELECT id FROM baseline
         ";
-        assert_eq!(
-            summarize(sql).as_deref(),
-            Some("INSERT normalized_event_state_artifact")
-        );
+        assert_eq!(summarize(sql).as_deref(), Some("INSERT event_reports"));
+    }
+
+    #[test]
+    fn write_targets_are_not_resolved_through_cte_aliases() {
+        for statement in [
+            "INSERT INTO reports SELECT * FROM reports",
+            "UPDATE reports SET id = 1",
+            "DELETE FROM reports",
+        ] {
+            let sql = format!("WITH reports AS (SELECT id FROM source) {statement}");
+            let operation = statement.split_whitespace().next().unwrap();
+            assert_eq!(summarize(&sql), Some(format!("{operation} reports")));
+        }
     }
 
     #[test]
